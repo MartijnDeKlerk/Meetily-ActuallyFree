@@ -63,28 +63,28 @@ impl AudioDevice {
         AudioDevice { name, device_type }
     }
 
-    pub fn from_name(name: &str) -> Result<Self> {
+    pub fn from_name(name: &str, device_type: DeviceType) -> Result<Self> {
         if name.trim().is_empty() {
             return Err(anyhow!("Device name cannot be empty"));
         }
 
-        let (name, device_type) = if name.to_lowercase().ends_with("(input)") {
-            (
-                name.trim_end_matches("(input)").trim().to_string(),
-                DeviceType::Input,
-            )
-        } else if name.to_lowercase().ends_with("(output)") {
-            (
-                name.trim_end_matches("(output)").trim().to_string(),
-                DeviceType::Output,
-            )
+        // The frontend's toDeviceOptionValue() always appends "(input)"/
+        // "(output)" when saving a preference (frontend/src/lib/audio-devices.ts).
+        // Strip it here so the resolved name matches what devices are actually
+        // listed/looked-up as (a PulseAudio description, a raw cpal name, a
+        // "... (System Audio)" tag, ...) - but the caller's `device_type` is
+        // always authoritative; a name with no suffix (or an unrecognized one)
+        // is not an error.
+        let lower = name.to_lowercase();
+        let stripped = if lower.ends_with("(input)") {
+            name.trim_end_matches("(input)").trim()
+        } else if lower.ends_with("(output)") {
+            name.trim_end_matches("(output)").trim()
         } else {
-            return Err(anyhow!(
-                "Device type (input/output) not specified in the name"
-            ));
+            name
         };
 
-        Ok(AudioDevice::new(name, device_type))
+        Ok(AudioDevice::new(stripped.to_string(), device_type))
     }
 }
 
@@ -102,9 +102,15 @@ impl fmt::Display for AudioDevice {
     }
 }
 
-/// Parse audio device from string name
-pub fn parse_audio_device(name: &str) -> Result<AudioDevice> {
-    AudioDevice::from_name(name)
+/// Parse audio device from a stored preference/name string.
+///
+/// The frontend always appends "(input)"/"(output)" when saving a preference
+/// (see toDeviceOptionValue in frontend/src/lib/audio-devices.ts), so that
+/// suffix is stripped here rather than used to infer the type - the caller
+/// supplies the device type directly from context (which field the preference
+/// came from), since a name with no recognizable suffix must still resolve.
+pub fn parse_audio_device(name: &str, device_type: DeviceType) -> Result<AudioDevice> {
+    AudioDevice::from_name(name, device_type)
 }
 
 /// Get device and config for audio operations
@@ -124,6 +130,25 @@ pub async fn get_device_and_config(
 
         match audio_device.device_type {
             DeviceType::Input => {
+                // Linux microphones are listed as PulseAudio/PipeWire source
+                // descriptions (see configure_linux_audio), not raw cpal/ALSA
+                // names, so validate against the Pulse server first - the ALSA
+                // loop below only ever matches the degraded-mode fallback names
+                // ("default"/"pipewire"/"pulse").
+                #[cfg(target_os = "linux")]
+                if crate::audio::capture::find_source_by_description(&audio_device.name).is_ok() {
+                    let _guard = super::platform::linux::ALSA_GLOBAL_LOCK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let dummy_device = host
+                        .default_input_device()
+                        .ok_or_else(|| anyhow!("No default input device"))?;
+                    let config = dummy_device
+                        .default_input_config()
+                        .map_err(|e| anyhow!("Failed to get config: {}", e))?;
+                    return Ok((dummy_device, config));
+                }
+
                 #[cfg(target_os = "linux")]
                 let _guard = super::platform::linux::ALSA_GLOBAL_LOCK
                     .lock()
