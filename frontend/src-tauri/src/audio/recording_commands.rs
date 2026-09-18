@@ -20,7 +20,8 @@ use super::{
     default_output_device,  // Get default system audio
     RecordingManager,
     DeviceEvent,
-    DeviceMonitorType
+    DeviceMonitorType,
+    DeviceType,
 };
 
 // Import transcription modules
@@ -259,7 +260,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let microphone_device = match preferred_mic_name {
         Some(pref_name) => {
             info!("ðŸŽ¤ Attempting to use preferred microphone: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
+            match parse_audio_device(&pref_name, DeviceType::Input) {
                 Ok(device) => {
                     match get_device_and_config(&device).await {
                         Ok(_) => {
@@ -339,7 +340,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     let system_device = match preferred_system_name {
         Some(pref_name) => {
             info!("ðŸ”Š Attempting to use preferred system audio: '{}'", pref_name);
-            match parse_audio_device(&pref_name) {
+            match parse_audio_device(&pref_name, DeviceType::Output) {
                 Ok(device) => {
                     match get_device_and_config(&device).await {
                         Ok(_) => {
@@ -559,7 +560,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Resolve devices against the current enumeration. A syntactically valid
     // persisted name can refer to hardware that has since disconnected.
     let mic_device = if let Some(ref name) = mic_device_name {
-        let preferred = parse_audio_device(name)
+        let preferred = parse_audio_device(name, DeviceType::Input)
             .map_err(|e| format!("Invalid microphone device '{}': {}", name, e))?;
         match get_device_and_config(&preferred).await {
             Ok(_) => Some(Arc::new(preferred)),
@@ -601,7 +602,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     #[cfg(not(target_os = "macos"))]
     let system_device = if let Some(ref name) = system_device_name {
-        let preferred = parse_audio_device(name)
+        let preferred = parse_audio_device(name, DeviceType::Output)
             .map_err(|e| format!("Invalid system device '{}': {}", name, e))?;
         match get_device_and_config(&preferred).await {
             Ok(_) => Some(Arc::new(preferred)),

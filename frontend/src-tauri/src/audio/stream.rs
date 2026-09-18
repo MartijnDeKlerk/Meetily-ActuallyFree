@@ -393,10 +393,11 @@ impl AudioStream {
             device.name
         );
 
-        // Microphone names are stored as the PulseAudio source description.
-        // from_name() has already stripped the "(input)" suffix. If the
-        // description isn't known (stale saved preference or degraded-mode
-        // entry), this errors out and the caller falls back to CPAL.
+        // Microphone names are stored as the plain PulseAudio source
+        // description (configure_linux_audio never appends an "(input)"
+        // suffix, so there's nothing to strip here). If the description isn't
+        // known (stale saved preference or degraded-mode entry), this errors
+        // out and the caller falls back to CPAL.
         let source_name = find_source_by_description(&device.name)
             .map_err(|e| anyhow::anyhow!("Failed to resolve PulseAudio source '{}': {}", device.name, e))?;
 
