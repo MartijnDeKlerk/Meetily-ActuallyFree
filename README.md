@@ -111,7 +111,17 @@ terminal) — no system install step is required. See [Build](#build) below for
 requirements and other GPU backends.
 
 There is no in-app update check on Linux; rebuild and replace the AppImage to
-update.
+update, or just run:
+
+```bash
+cd frontend
+./update-linux.sh
+```
+
+This pulls the latest source, rebuilds, and atomically replaces the installed
+AppImage (default `~/Applications/Meetily-ActuallyFree.AppImage`; override
+with `INSTALL_DIR`/`INSTALL_NAME`). It refuses to run over uncommitted local
+changes.
 
 ## Local Data
 
