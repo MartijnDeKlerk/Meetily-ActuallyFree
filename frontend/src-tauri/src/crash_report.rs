@@ -134,6 +134,13 @@ pub fn install_panic_hook() {
 }
 
 pub fn start_session() -> Result<(), String> {
+    // Debug builds are killed and restarted by the dev CLI on every Rust file
+    // change, so they never reach the RunEvent::Exit cleanup below. Tracking
+    // sessions there would flag every hot reload as an unexpected exit.
+    if cfg!(debug_assertions) {
+        return Ok(());
+    }
+
     let holder = CURRENT_SESSION_ID.get_or_init(|| Mutex::new(None));
     let mut current_session = holder
         .lock()
