@@ -94,6 +94,35 @@ launch checks, but physical macOS 14.2 capture qualification is still pending.
 Treat it as a preview and verify recordings before relying on it for critical
 meetings.
 
+### Linux
+
+There is no prebuilt Linux release yet — build the AppImage yourself:
+
+```bash
+cd frontend
+npm install
+export TAURI_GPU_FEATURE=hipblas   # or cuda / vulkan / none; omit to auto-detect
+./build-gpu.sh
+```
+
+The AppImage is written to `target/release/bundle/appimage/`. Make it
+executable and run it directly (`chmod +x`, then double-click or run from a
+terminal) — no system install step is required. See [Build](#build) below for
+requirements and other GPU backends.
+
+There is no in-app update check on Linux; rebuild and replace the AppImage to
+update, or just run:
+
+```bash
+cd frontend
+./update-linux.sh
+```
+
+This pulls the latest source, rebuilds, and atomically replaces the installed
+AppImage (default `~/Applications/Meetily-ActuallyFree.AppImage`; override
+with `INSTALL_DIR`/`INSTALL_NAME`). It refuses to run over uncommitted local
+changes.
+
 ## Local Data
 
 | Data | Location |
@@ -135,6 +164,29 @@ cd frontend
 pnpm install
 ./scripts/build-macos-apple-silicon.sh
 ```
+
+Linux requirements: Rust, Node.js (npm or pnpm), CMake, and clang/libclang
+(whisper.cpp/llama.cpp compile from source via bindgen). For GPU builds,
+install the vendor SDK first: CUDA Toolkit for NVIDIA, ROCm for AMD, or the
+Vulkan SDK.
+
+```bash
+cd frontend
+npm install
+export TAURI_GPU_FEATURE=none   # dev mode; drop this line to auto-detect a GPU backend
+./dev-gpu.sh
+```
+
+GPU-accelerated release build producing an AppImage:
+
+```bash
+cd frontend
+export TAURI_GPU_FEATURE=hipblas   # or cuda / vulkan / none
+./build-gpu.sh
+```
+
+`TAURI_GPU_FEATURE` accepts `cuda`, `hipblas` (AMD ROCm), `vulkan`, or `none`;
+leave it unset to auto-detect from installed drivers.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for implementation details and the
 [`macOS release runbook`](.github/workflows/MACOS_RELEASE.md) for the native
