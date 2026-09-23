@@ -88,6 +88,7 @@ impl WhisperEngine {
             }
             WhisperCompiledBackend::HipBlas => {
                 log::info!("HIP BLAS feature enabled - attempting GPU acceleration");
+                Self::configure_rocm_tensile_libpath();
                 true
             }
             WhisperCompiledBackend::Cpu => {
@@ -95,6 +96,61 @@ impl WhisperEngine {
                 false
             }
         }
+    }
+
+    /// Portable/AppImage builds bundle `librocblas.so` without its ~900MB
+    /// Tensile kernel library directory (too large to ship), so rocBLAS's own
+    /// relative-path lookup for `TensileLibrary*.dat/.co` finds nothing and it
+    /// hard-aborts (not a recoverable error) on the first GEMM call. Point
+    /// `ROCBLAS_TENSILE_LIBPATH` at a system ROCm install instead, mirroring
+    /// the ROCm path candidates already used by build-gpu.sh/dev-gpu.sh.
+    fn configure_rocm_tensile_libpath() {
+        if std::env::var_os("ROCBLAS_TENSILE_LIBPATH").is_some() {
+            return;
+        }
+
+        let candidates = [
+            std::env::var("ROCM_PATH").ok(),
+            std::env::var("HIP_PATH").ok(),
+            Some("/opt/rocm".to_string()),
+            Some("/usr/local/rocm".to_string()),
+            Some("/usr/lib64/rocm".to_string()),
+            Some("/usr/lib/rocm".to_string()),
+        ];
+
+        for root in candidates.into_iter().flatten() {
+            let lib_path = PathBuf::from(root).join("lib/rocblas/library");
+            let has_tensile_library = lib_path
+                .read_dir()
+                .map(|entries| {
+                    entries.filter_map(|entry| entry.ok()).any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("TensileLibrary")
+                    })
+                })
+                .unwrap_or(false);
+
+            if has_tensile_library {
+                log::info!(
+                    "Pointing rocBLAS at system Tensile library: {}",
+                    lib_path.display()
+                );
+                // SAFETY: called once during single-threaded startup, before
+                // any other code reads or writes the process environment.
+                unsafe {
+                    std::env::set_var("ROCBLAS_TENSILE_LIBPATH", &lib_path);
+                }
+                return;
+            }
+        }
+
+        log::warn!(
+            "HIP BLAS enabled but no system ROCm rocblas Tensile library was found \
+             (checked ROCM_PATH/HIP_PATH, /opt/rocm, /usr/local/rocm, /usr/lib64/rocm, /usr/lib/rocm) - \
+             GPU transcription will likely crash. Install ROCm, or set ROCBLAS_TENSILE_LIBPATH manually."
+        );
     }
 
     pub fn new() -> Result<Self> {
