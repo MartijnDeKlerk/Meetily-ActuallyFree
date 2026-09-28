@@ -18,6 +18,7 @@ import { OllamaDownloadProvider } from '@/contexts/OllamaDownloadContext'
 import { TranscriptProvider } from '@/contexts/TranscriptContext'
 import { ConfigProvider, useConfig } from '@/contexts/ConfigContext'
 import { OnboardingProvider } from '@/contexts/OnboardingContext'
+import { OptionalModelDownloadsProvider } from '@/contexts/OptionalModelDownloadsContext'
 import { OnboardingFlow } from '@/components/onboarding'
 import { loadBetaFeatures } from '@/types/betaFeatures'
 import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgressToast'
@@ -126,6 +127,15 @@ export default function RootLayout({
   }, [startupAttempt])
 
   // Disable context menu in production
+  useEffect(() => {
+    let disposed = false;
+    let stop: UnlistenFn | undefined;
+    void listen<string>('live-diarization-error', event => {
+      toast.error('Live speaker labeling unavailable', { description: event.payload, duration: 10000 });
+    }).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; });
+    return () => { disposed = true; stop?.(); };
+  }, []);
+
   useEffect(() => {
     if (process.env.NODE_ENV === 'production') {
       const handleContextMenu = (e: MouseEvent) => e.preventDefault();
@@ -354,7 +364,12 @@ export default function RootLayout({
     <html lang="en" className="dark">
       <body className={`${sourceSans3.variable} font-sans antialiased`}>
         {!startupResolved ? (
-          <div className="h-screen bg-[var(--af-bg)]" />
+          <div className="flex h-screen items-center justify-center bg-[var(--af-bg)]">
+            <div className="flex flex-col items-center gap-3">
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+              <span className="text-xs text-[var(--af-text-2)] font-medium">Starting Meetily…</span>
+            </div>
+          </div>
         ) : startupError ? (
           <div className="flex h-screen items-center justify-center bg-[var(--af-bg)] px-6">
             <div className="max-w-md rounded-xl border border-[var(--af-border)] bg-[var(--af-panel)] p-6 text-center shadow-xl">
@@ -380,6 +395,7 @@ export default function RootLayout({
                 <ConfigProvider>
                   <OllamaDownloadProvider>
                     <OnboardingProvider>
+                      <OptionalModelDownloadsProvider>
                       <SidebarProvider>
                         <TooltipProvider>
                           <RecordingPostProcessingProvider>
@@ -410,6 +426,7 @@ export default function RootLayout({
                           </RecordingPostProcessingProvider>
                         </TooltipProvider>
                       </SidebarProvider>
+                      </OptionalModelDownloadsProvider>
                     </OnboardingProvider>
                   </OllamaDownloadProvider>
                 </ConfigProvider>

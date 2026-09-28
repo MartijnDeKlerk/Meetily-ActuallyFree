@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "resources": [
+      "templates/*.json",
+      "resources/diarization/*",
+      "runtime-deps/*",
+      "installer-variants/*",
+      "binaries/onnxruntime/*"
+    ]
+  }
+}

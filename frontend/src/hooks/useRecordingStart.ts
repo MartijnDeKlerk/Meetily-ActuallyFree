@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { transcriptionRuntimeMessage } from '@/lib/transcription-runtime';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -31,6 +32,7 @@ export function useRecordingStart(
   showModal?: (name: 'modelSelector', message?: string) => void
 ): UseRecordingStartReturn {
   const [isAutoStarting, setIsAutoStarting] = useState(false);
+  const runtimeErrorRef = useRef<string | null>(null);
 
   const { clearTranscripts, setMeetingTitle } = useTranscripts();
   const { setIsMeetingActive } = useSidebar();
@@ -61,6 +63,15 @@ export function useRecordingStart(
   // Prefer Parakeet for live (fast). Whisper is for post-call enhance/retranscribe.
   // Prefetch the configured provider so Start Recording feels snappy after idle unload.
   const prefetchSttModel = useCallback(async (): Promise<boolean> => {
+    runtimeErrorRef.current = null;
+    try {
+      await invoke('check_transcription_runtime');
+    } catch (error) {
+      const message = transcriptionRuntimeMessage(error) || 'Could not check the speech runtime. Restart Meetily and try again.';
+      runtimeErrorRef.current = message;
+      toast.error('Speech recognition unavailable', { description: message });
+      return false;
+    }
     const provider = (transcriptModelConfig?.provider || 'parakeet').toLowerCase();
     const preferParakeet = provider === 'parakeet' || provider.includes('parakeet');
 
@@ -138,6 +149,10 @@ export function useRecordingStart(
       // Prefetch STT (Parakeet by default for live). Unloads LLM first via Rust.
       const sttReady = await prefetchSttModel();
       if (!sttReady) {
+        if (runtimeErrorRef.current) {
+          setStatus(RecordingStatus.ERROR, runtimeErrorRef.current);
+          return;
+        }
         const isDownloading = await checkIfModelDownloading();
         if (isDownloading) {
           toast.info('Model download in progress', {
@@ -191,6 +206,13 @@ export function useRecordingStart(
       await showRecordingNotification();
     } catch (error) {
       console.error('Failed to start recording:', error);
+      const runtimeMessage = transcriptionRuntimeMessage(error);
+      if (runtimeMessage) {
+        setStatus(RecordingStatus.ERROR, runtimeMessage);
+        setIsRecording(false);
+        toast.error('Speech recognition unavailable', { description: runtimeMessage });
+        return;
+      }
       setStatus(RecordingStatus.ERROR, error instanceof Error ? error.message : 'Failed to start recording');
       setIsRecording(false); // Reset state on error
       Analytics.trackButtonClick('start_recording_error', 'home_page');
@@ -211,6 +233,11 @@ export function useRecordingStart(
 
           const sttReady = await prefetchSttModel();
           if (!sttReady) {
+            if (runtimeErrorRef.current) {
+              setStatus(RecordingStatus.ERROR, runtimeErrorRef.current);
+              setIsAutoStarting(false);
+              return;
+            }
             const isDownloading = await checkIfModelDownloading();
             if (isDownloading) {
               toast.info('Model download in progress', {
@@ -261,6 +288,12 @@ export function useRecordingStart(
             await showRecordingNotification();
           } catch (error) {
             console.error('Failed to auto-start recording:', error);
+            const runtimeMessage = transcriptionRuntimeMessage(error);
+            if (runtimeMessage) {
+              setStatus(RecordingStatus.ERROR, runtimeMessage);
+              toast.error('Speech recognition unavailable', { description: runtimeMessage });
+              return;
+            }
             setStatus(RecordingStatus.ERROR, error instanceof Error ? error.message : 'Failed to auto-start recording');
             alert('Failed to start recording. Check console for details.');
             Analytics.trackButtonClick('start_recording_error', 'sidebar_auto');
@@ -300,6 +333,11 @@ export function useRecordingStart(
 
       const sttReady = await prefetchSttModel();
       if (!sttReady) {
+        if (runtimeErrorRef.current) {
+          setStatus(RecordingStatus.ERROR, runtimeErrorRef.current);
+          setIsAutoStarting(false);
+          return;
+        }
         const isDownloading = await checkIfModelDownloading();
         if (isDownloading) {
           toast.info('Model download in progress', {
@@ -349,6 +387,12 @@ export function useRecordingStart(
         await showRecordingNotification();
       } catch (error) {
         console.error('Failed to start recording from sidebar:', error);
+        const runtimeMessage = transcriptionRuntimeMessage(error);
+        if (runtimeMessage) {
+          setStatus(RecordingStatus.ERROR, runtimeMessage);
+          toast.error('Speech recognition unavailable', { description: runtimeMessage });
+          return;
+        }
         setStatus(RecordingStatus.ERROR, error instanceof Error ? error.message : 'Failed to start recording from sidebar');
         alert('Failed to start recording. Check console for details.');
         Analytics.trackButtonClick('start_recording_error', 'sidebar_direct');

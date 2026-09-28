@@ -136,6 +136,7 @@ impl ContinuousVadProcessor {
                VAD_SAMPLE_RATE, redemption_time_ms, positive_speech_threshold,
                negative_speech_threshold, 250, input_sample_rate);
 
+        crate::onnx_runtime::ensure_available()?;
         let session = VadSession::new(config)
             .map_err(|e| anyhow!("Failed to create VAD session: {:?}", e))?;
 
@@ -165,6 +166,12 @@ impl ContinuousVadProcessor {
     /// Process incoming audio samples and return any complete speech segments
     /// Handles resampling from input sample rate to 16kHz for VAD processing
     pub fn process_audio(&mut self, samples: &[f32]) -> Result<Vec<SpeechSegment>> {
+        self.process_audio_observed(samples, |_, _| {})
+    }
+
+    /// Observe continuous 16 kHz audio before VAD removes silence, on the same
+    /// recording-relative clock used by emitted transcript segments.
+    pub fn process_audio_observed(&mut self, samples: &[f32], observe: impl FnOnce(u64, &[f32])) -> Result<Vec<SpeechSegment>> {
         // Resample to 16kHz if needed
         let resampled_audio = if self.sample_rate == 16000 {
             samples.to_vec()
@@ -172,6 +179,7 @@ impl ContinuousVadProcessor {
             self.resample_to_16k(samples)?
         };
 
+        observe((self.processed_samples + self.buffer.len()) as u64, &resampled_audio);
         self.buffer.extend_from_slice(&resampled_audio);
         let mut completed_segments = Vec::new();
 
@@ -522,6 +530,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_nemotron_observer_receives_resampled_silence_on_the_vad_clock() {
+        let mut vad = ContinuousVadProcessor::new(48000, 400).unwrap();
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            vad.process_audio_observed(&vec![0.0; 2400], |start, audio| {
+                observed.push((start, audio.len()));
+                assert!(audio.iter().all(|&s| s == 0.0));
+            }).unwrap();
+        }
+        assert_eq!(observed, vec![(0, 800), (800, 800), (1600, 800)]);
+        vad.advance_inactive_timeline_to(3.0);
+        vad.process_audio_observed(&vec![0.0; 2400], |start, audio| {
+            assert_eq!(start, 48000);
+            assert_eq!(audio.len(), 800);
+        }).unwrap();
+    }
 
     /// Generate synthetic speech-like audio with alternating speech/silence
     fn generate_test_audio_with_speech(duration_seconds: f32, sample_rate: u32) -> Vec<f32> {

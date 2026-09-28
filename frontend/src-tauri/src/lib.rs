@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 // Removed unused import
@@ -45,6 +45,11 @@ pub mod diarization;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
+pub mod onnx_runtime;
+#[cfg(all(test, windows))]
+#[allow(dead_code)]
+#[path = "../build/onnxruntime.rs"]
+mod onnx_runtime_build_tests;
 pub mod openai;
 pub mod anthropic;
 pub mod groq;
@@ -462,6 +467,8 @@ pub fn run() {
             if let Err(error) = crash_report::start_session() {
                 log::error!("Failed to initialize crash reporting: {error}");
             }
+            #[cfg(windows)]
+            onnx_runtime::initialize(_app.handle());
             log::info!("Application setup complete");
 
             // Initialize system tray
@@ -693,6 +700,7 @@ pub fn run() {
             crash_report::prepare_for_app_restart,
             crash_report::resume_crash_session,
             trigger_microphone_permission,
+            onnx_runtime::check_transcription_runtime,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
             start_audio_level_monitoring,
@@ -745,6 +753,11 @@ pub fn run() {
             diarization::diarize_recording,
             diarization::diarize_meeting,
             diarization::rename_meeting_speaker,
+            diarization::get_diarization_engine,
+            diarization::set_diarization_engine,
+            diarization::diarization_get_status,
+            diarization::set_diarization_config,
+            diarization::open_diarization_model_directory,
             minibar::enter_compact_mode,
             minibar::exit_compact_mode,
             minibar::is_compact_mode,

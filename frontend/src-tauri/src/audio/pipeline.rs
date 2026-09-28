@@ -957,7 +957,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
-    ) -> Self {
+    ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
         info!(
@@ -984,26 +984,16 @@ impl AudioPipeline {
         let redemption_time = 800;
 
         // One VAD per capture source so simultaneous talk is segmented independently.
-        let make_vad = |label: &str, positive_threshold, negative_threshold| {
-            match ContinuousVadProcessor::new_with_thresholds(
-            sample_rate,
-            redemption_time,
-            positive_threshold,
-            negative_threshold,
-        ) {
-            Ok(processor) => {
-                info!("VAD ready for {label}: segments go straight to Whisper (no shared mix)");
-                processor
-            }
-            Err(e) => {
-                error!("Failed to create {label} VAD processor: {e}");
-                panic!("VAD processor creation failed: {e}");
-            }
-            }
+        let make_vad = |label: &str, positive_threshold, negative_threshold| -> Result<ContinuousVadProcessor> {
+            let processor = ContinuousVadProcessor::new_with_thresholds(
+                sample_rate, redemption_time, positive_threshold, negative_threshold,
+            )?;
+            info!("VAD ready for {label}: separate source segmentation");
+            Ok(processor)
         };
         // Headset/array microphones are usually quieter than digital loopback.
-        let mic_vad = make_vad("microphone", 0.20, 0.10);
-        let system_vad = make_vad("system", 0.50, 0.35);
+        let mic_vad = make_vad("microphone", 0.20, 0.10)?;
+        let system_vad = make_vad("system", 0.50, 0.35)?;
 
         // Initialize professional audio mixing components (recording file only)
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate, mic_enabled, system_enabled);
@@ -1012,7 +1002,7 @@ impl AudioPipeline {
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
 
-        Self {
+        Ok(Self {
             receiver,
             transcription_sender,
             state,
@@ -1036,7 +1026,7 @@ impl AudioPipeline {
             system_limiter_hit_since_emit: false,
             last_mic_input: std::time::Instant::now(),
             last_system_input: std::time::Instant::now(),
-        }
+        })
     }
 
     fn finalize_inactive_speech(&mut self, now: std::time::Instant) {
@@ -1074,7 +1064,11 @@ impl AudioPipeline {
         transcription_sender: &mpsc::UnboundedSender<AudioChunk>,
         chunk_id_counter: &mut u64,
     ) {
-        match vad.process_audio(samples) {
+        match vad.process_audio_observed(samples, |start, audio| {
+            if matches!(device_type, DeviceType::System) {
+                crate::diarization::live_nemotron::feed(start, audio);
+            }
+        }) {
             Ok(speech_segments) => Self::enqueue_source_speech(
                 speech_segments,
                 device_type,
@@ -1269,7 +1263,7 @@ impl AudioPipeline {
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
-                        if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+            if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
                             // STEP 3: Transcribe each source independently.
                             // Same wall-clock windows (aligned by the ring buffer),
                             // separate sample streams + VAD state — so when both
@@ -1392,6 +1386,7 @@ impl AudioPipeline {
             }
         }
 
+        crate::diarization::live_nemotron::finish();
         let mic_final = self.mic_vad.flush();
         let sys_final = self.system_vad.flush();
 
@@ -1455,19 +1450,20 @@ impl AudioPipelineManager {
     }
 
     /// Start the audio pipeline with device information for adaptive buffering
-    pub fn start(
+    pub fn start<F>(
         &mut self,
         state: Arc<RecordingState>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
-        recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        create_recording_sender: F,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
         level_sender: Option<mpsc::UnboundedSender<AudioLevels>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where F: FnOnce() -> Result<mpsc::UnboundedSender<AudioChunk>> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
         info!(
@@ -1482,9 +1478,6 @@ impl AudioPipelineManager {
         // Create audio processing channel
         let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // Set sender in state for audio captures to use
-        state.set_audio_sender(audio_sender.clone());
-
         // Create and start pipeline with device information for adaptive mixing
         let mut pipeline = AudioPipeline::new(
             audio_receiver,
@@ -1496,11 +1489,13 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
-        );
+        ).map_err(crate::onnx_runtime::InitializationError)?;
 
-        // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
-        // This ensures both mic AND system audio are captured in recordings
-        pipeline.recording_sender_for_mixed = recording_sender;
+        // VAD construction must succeed before creating folders or saver tasks.
+        // The fork's saver still validates all three aligned destinations before
+        // exposing a sender. Storage errors retain their own classification.
+        pipeline.recording_sender_for_mixed = Some(create_recording_sender()?);
+        state.set_audio_sender(audio_sender.clone());
 
         // Connect live level meter output (mic + system) for the frontend visualizer
         pipeline.level_sender = level_sender;

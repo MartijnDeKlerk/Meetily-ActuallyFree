@@ -851,6 +851,7 @@ fn write_retranscription_metadata(
         let existing = std::fs::read_to_string(&metadata_path)?;
         let mut value: serde_json::Value = serde_json::from_str(&existing)?;
         if let Some(obj) = value.as_object_mut() {
+            obj.insert("duration_seconds".to_string(), serde_json::json!(duration_seconds));
             obj.insert("retranscribed_at".to_string(), serde_json::json!(now));
             obj.insert("status".to_string(), serde_json::json!("completed"));
             obj.insert("transcript_file".to_string(), serde_json::json!("transcripts.json"));
@@ -988,6 +989,24 @@ pub async fn is_retranscription_in_progress_command() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retranscription_repairs_duration_and_preserves_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+            "meeting_id":"original", "duration_seconds":2.5,
+            "audio_file":"voice.m4a", "summary_language":"fr",
+            "detected_summary_language":"en", "custom_field":"keep"
+        })).unwrap()).unwrap();
+        write_retranscription_metadata(dir.path(), "ignored", 5.16, "voice.m4a").unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(result["duration_seconds"], 5.16);
+        assert_eq!(result["meeting_id"], "original");
+        assert_eq!(result["summary_language"], "fr");
+        assert_eq!(result["custom_field"], "keep");
+        assert!(result.get("detected_summary_language").is_none());
+    }
 
     fn test_recording_start() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")

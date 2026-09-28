@@ -214,11 +214,10 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
 
     let mut chunks = Vec::new();
     let mut start_char = 0;
-    // Step is the size of the non-overlapping part of the window
-    let step = chunk_size_chars.saturating_sub(overlap_chars).max(1);
 
     while start_char < total_chars {
         let end_char = (start_char + chunk_size_chars).min(total_chars);
+        let mut emitted_end_char = end_char;
 
         // Convert character indices to byte indices for string slicing
         let start_byte: usize = chars[..start_char].iter().map(|c| c.len_utf8()).sum();
@@ -227,24 +226,27 @@ pub fn chunk_text(text: &str, chunk_size_tokens: usize, overlap_tokens: usize) -
         // Try to break at sentence or word boundary for cleaner chunks
         if end_char < total_chars {
             let slice = &text[start_byte..end_byte];
-            // Look for sentence boundary (period followed by space)
-            if let Some(last_period) = slice.rfind(". ") {
-                end_byte = start_byte + last_period + 2;
-            } else if let Some(last_space) = slice.rfind(' ') {
-                // Fall back to word boundary (space)
-                end_byte = start_byte + last_space + 1;
+            // Upstream #603: advance from what was actually emitted, not the
+            // original window. Reject boundaries that cannot make progress.
+            let sentence = slice.rfind(". ").map(|index| index + 2);
+            let word = slice.rfind(' ').map(|index| index + 1);
+            let boundary = sentence
+                .filter(|end| slice[..*end].chars().count() > overlap_chars)
+                .or_else(|| word.filter(|end| slice[..*end].chars().count() > overlap_chars));
+            if let Some(boundary) = boundary {
+                end_byte = start_byte + boundary;
+                emitted_end_char = start_char + slice[..boundary].chars().count();
             }
         }
 
         // Extract chunk
         chunks.push(text[start_byte..end_byte].to_string());
 
-        if end_char >= total_chars {
+        if emitted_end_char >= total_chars {
             break;
         }
 
-        // Move to next chunk with overlap (in character units)
-        start_char += step;
+        start_char = emitted_end_char.saturating_sub(overlap_chars).max(start_char + 1);
     }
 
     info!("Created {} chunks from text", chunks.len());
@@ -728,6 +730,20 @@ async fn normalize_markdown_to_english(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_text_preserves_content_after_early_sentence_boundary() {
+        let chunks = chunk_text("Intro. LOST_MARKER trailing content ensures chunking", 10, 1);
+        assert!(chunks.iter().any(|chunk| chunk.contains("LOST_MARKER")), "{chunks:?}");
+    }
+
+    #[test]
+    fn chunk_text_keeps_unicode_boundaries_and_forward_progress() {
+        assert_eq!(chunk_text("é ab", 1, 0), vec!["é ", "ab"]);
+        assert_eq!(chunk_text("abcd", 1, 1), vec!["abc", "bcd"]);
+        assert_eq!(chunk_text("", 1, 0), Vec::<String>::new());
+        assert_eq!(chunk_text("text", 0, 0), Vec::<String>::new());
+    }
 
     #[test]
     fn chunk_summary_prompt_forces_english_base_output() {

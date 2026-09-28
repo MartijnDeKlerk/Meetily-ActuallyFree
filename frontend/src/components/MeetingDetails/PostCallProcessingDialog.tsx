@@ -16,6 +16,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useDiarizationEngine } from '@/hooks/useDiarizationEngine';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { Loader2, Sparkles, Users } from 'lucide-react';
 import { toast } from 'sonner';
@@ -69,12 +70,12 @@ async function resolveEnhancementModel(
     invoke<RawModelInfo[]>('parakeet_get_available_models').catch(() => []),
   ]);
   const available: ModelChoice[] = [
-    ...whisperModels
-      .filter((model) => model.status === 'Available')
-      .map((model) => ({ provider: 'whisper' as const, name: model.name })),
     ...parakeetModels
       .filter((model) => model.status === 'Available' && isVisibleParakeetModel(model.name))
       .map((model) => ({ provider: 'parakeet' as const, name: model.name })),
+    ...whisperModels
+      .filter((model) => model.status === 'Available')
+      .map((model) => ({ provider: 'whisper' as const, name: model.name })),
   ];
   const normalizedProvider = configuredProvider === 'localWhisper'
     ? 'whisper'
@@ -88,7 +89,9 @@ async function resolveEnhancementModel(
     if (sameProvider) return sameProvider;
     throw new Error(`No downloaded ${normalizedProvider} model is available for enhancement.`);
   }
-  const localDefault = available.find((model) => model.provider === 'parakeet') ?? available[0];
+  const localDefault = available.find((model) => model.provider === 'parakeet')
+    ?? available.find((model) => model.provider === 'whisper')
+    ?? available[0];
   if (localDefault) return localDefault;
   throw new Error('No downloaded transcription model is available for post-call enhancement.');
 }
@@ -197,6 +200,7 @@ export function PostCallProcessingDialog({
 }) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
   const [stage, setStage] = useState<Stage>('idle');
+  const { engine, isNemotron, error: engineError } = useDiarizationEngine(stage !== 'idle');
   const [speakerCount, setSpeakerCount] = useState('2');
   const [autoDetectSpeakers, setAutoDetectSpeakers] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -289,7 +293,7 @@ export function PostCallProcessingDialog({
   };
 
   const getSelectedSpeakerCount = (): number | null | undefined => {
-    if (autoDetectSpeakers) return null;
+    if (isNemotron || autoDetectSpeakers) return null;
     const count = Number(speakerCount);
     if (!Number.isInteger(count) || count < 1 || count > 20) {
       setError('Enter the total number of speakers, from 1 to 20.');
@@ -383,14 +387,20 @@ export function PostCallProcessingDialog({
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Users size={18} className="text-blue-400" />
-              How many people spoke?
+              {isNemotron ? 'Identify speakers with Nemotron' : 'How many people spoke?'}
             </DialogTitle>
             <DialogDescription id="post-call-processing-description">
-              Include yourself in the total. Entering the actual number gives more accurate speaker labels, or choose Auto-detect if you are not sure.
+              {isNemotron
+              ? 'Nemotron automatically detects up to 8 speakers and refines the live labels using the completed recording.'
+                : 'Include yourself in the total. Entering the actual number gives more accurate speaker labels, or choose Auto-detect if you are not sure.'}
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4 py-2">
+            {engineError && <p role="alert" className="text-sm text-red-400">{engineError}</p>}
+            {!engine && !engineError && <p role="status">Loading diarization settings…</p>}
+            {isNemotron && <p className="text-sm">Auto-detect</p>}
+            {engine && !isNemotron && <>
             <div className="grid grid-cols-4 gap-2">
               {[1, 2, 3, 4, 5, 6, 7, 8].map((count) => (
                 <Button
@@ -432,6 +442,7 @@ export function PostCallProcessingDialog({
               className="w-full rounded-md border border-[var(--af-border)] bg-[var(--af-panel-2)] px-3 py-2 text-sm text-[var(--af-text)] outline-none focus:ring-2 focus:ring-blue-500"
               aria-label="Total number of speakers"
             />
+            </>}
             {error && <p className="text-sm text-red-400">{error}</p>}
           </div>
 
@@ -441,7 +452,7 @@ export function PostCallProcessingDialog({
                 Use live transcript
               </Button>
             )}
-            <Button type="button" onClick={start}>
+            <Button type="button" onClick={start} disabled={!engine}>
               {stage === 'error' ? 'Retry' : 'Enhance meeting'}
             </Button>
           </DialogFooter>

@@ -49,6 +49,7 @@ async function resolveSummaryLanguage(
 }
 
 type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+let recoveryPollSequence = 0;
 
 interface UseSummaryGenerationProps {
   meeting: any;
@@ -78,6 +79,7 @@ export function useSummaryGeneration({
   const completionHandledRef = useRef(false);
   const activeMeetingIdRef = useRef(meeting.id);
   const activeProcessIdRef = useRef<string | null>(null);
+  const mountedRef = useRef(true);
   const summaryRequestGenerationRef = useRef(0);
   const setAiSummaryRef = useRef(setAiSummary);
   const onMeetingUpdatedRef = useRef(onMeetingUpdated);
@@ -164,6 +166,75 @@ export function useSummaryGeneration({
     };
   }, [meeting.id]);
 
+  // Reattach after navigation without replaying notifications for a historical
+  // completion. A late hydration request cannot overwrite a new local attempt.
+  useEffect(() => {
+    mountedRef.current = true;
+    const meetingId = meeting.id;
+    const generation = summaryRequestGenerationRef.current;
+    let disposed = false;
+    let pollOwner: string | null = null;
+    const isCurrent = () => !disposed && mountedRef.current &&
+      activeMeetingIdRef.current === meetingId && summaryRequestGenerationRef.current === generation;
+    const applySnapshot = async (result: any, resumed: boolean) => {
+      if (!isCurrent() || (result.meeting_id && result.meeting_id !== meetingId)) return;
+      const status = String(result.status ?? '').toLowerCase();
+      if (status === 'pending' || status === 'processing' || status === 'summarizing') {
+        setSummaryStatus(result.data ? 'regenerating' : 'processing');
+        setSummaryError(null);
+        if (result.data) setAiSummaryRef.current(result.data);
+        return;
+      }
+      activeProcessIdRef.current = null;
+      if (result.data) setAiSummaryRef.current(result.data);
+      if (status === 'failed' || status === 'error') {
+        setSummaryStatus('error');
+        setSummaryError(result.error || 'Summary generation failed. Please retry.');
+      } else if (status === 'completed' && !result.data) {
+        setSummaryStatus('error');
+        setSummaryError('Summary completed without content. Please retry.');
+      } else {
+        setSummaryStatus(result.data ? 'completed' : 'idle');
+        setSummaryError(null);
+      }
+      if (resumed && status === 'completed' && result.data && !completionHandledRef.current) {
+        completionHandledRef.current = true;
+        try {
+          await onMeetingUpdatedRef.current?.();
+        } catch (error) {
+          console.warn('Summary completed but meeting refresh failed:', error);
+        }
+      }
+    };
+    void (async () => {
+      try {
+        const result = await invokeTauri('api_get_summary', { meetingId }) as any;
+        if (!isCurrent()) return;
+        await applySnapshot(result, false);
+        if (!isCurrent()) return;
+        if (['pending', 'processing', 'summarizing'].includes(String(result.status).toLowerCase())) {
+          // A unique local owner, not a native process UUID or shared start time.
+          // Cleanup from an older view must not stop a newer view's same-run poll.
+          pollOwner = `resume:${meetingId}:${++recoveryPollSequence}`;
+          activeProcessIdRef.current = pollOwner;
+          startSummaryPolling(meetingId, pollOwner, (snapshot) => { void applySnapshot(snapshot, true); });
+        }
+      } catch (error) {
+        if (isCurrent()) {
+          setSummaryStatus('error');
+          setSummaryError('Could not restore summary status. Reopen this meeting to retry.');
+          console.error('Failed to restore summary status:', error);
+        }
+      }
+    })();
+    return () => {
+      disposed = true;
+      mountedRef.current = false;
+      // Preserve a newer poll that another mounted view may already own.
+      if (pollOwner) stopSummaryPollingRef.current(meetingId, pollOwner);
+    };
+  }, [meeting.id, startSummaryPolling]);
+
   // Helper to get status message
   const getSummaryStatusMessage = useCallback((status: SummaryStatus) => {
     switch (status) {
@@ -199,7 +270,7 @@ export function useSummaryGeneration({
     const requestMeetingId = meeting.id;
     const requestGeneration = providedRequestGeneration ?? ++summaryRequestGenerationRef.current;
     const isCurrentRequest = () =>
-      activeMeetingIdRef.current === requestMeetingId &&
+      mountedRef.current && activeMeetingIdRef.current === requestMeetingId &&
       summaryRequestGenerationRef.current === requestGeneration;
     if (!isCurrentRequest()) return false;
 
@@ -571,7 +642,7 @@ export function useSummaryGeneration({
     const requestMeetingId = meeting.id;
     const requestGeneration = ++summaryRequestGenerationRef.current;
     const isCurrentRequest = () =>
-      activeMeetingIdRef.current === requestMeetingId &&
+      mountedRef.current && activeMeetingIdRef.current === requestMeetingId &&
       summaryRequestGenerationRef.current === requestGeneration;
     if (!isCurrentRequest()) return false;
 
@@ -797,7 +868,7 @@ export function useSummaryGeneration({
     const requestMeetingId = meeting.id;
     const requestGeneration = ++summaryRequestGenerationRef.current;
     const isCurrentRequest = () =>
-      activeMeetingIdRef.current === requestMeetingId &&
+      mountedRef.current && activeMeetingIdRef.current === requestMeetingId &&
       summaryRequestGenerationRef.current === requestGeneration;
     setSummaryStatus('regenerating');
     setSummaryError(null);
@@ -858,23 +929,32 @@ export function useSummaryGeneration({
   // Public API: Stop ongoing summary generation
   const handleStopGeneration = useCallback(async () => {
     console.log('Stopping summary generation for meeting:', meeting.id);
-    summaryRequestGenerationRef.current += 1;
+    const meetingId = meeting.id;
+    const generation = ++summaryRequestGenerationRef.current;
+    const pollOwner = activeProcessIdRef.current;
     activeProcessIdRef.current = null;
     completionHandledRef.current = false;
 
     try {
       // Call backend to cancel the summary generation
-      await invokeTauri('api_cancel_summary', {
-        meetingId: meeting.id
-      });
+      await invokeTauri('api_cancel_summary', { meetingId });
       console.log('✓ Backend cancellation request sent for meeting:', meeting.id);
     } catch (error) {
       console.error('Failed to cancel summary generation:', error);
-      // Continue with frontend cleanup even if backend call fails
+      if (mountedRef.current && activeMeetingIdRef.current === meetingId &&
+          summaryRequestGenerationRef.current === generation) {
+        setSummaryStatus('error');
+        setSummaryError('Could not cancel the summary. Reopen this meeting to restore its current status.');
+        toast.error('Summary cancellation failed');
+      }
+      return;
     }
 
+    if (!mountedRef.current || activeMeetingIdRef.current !== meetingId ||
+        summaryRequestGenerationRef.current !== generation) return;
+
     // Stop polling
-    stopSummaryPolling(meeting.id);
+    stopSummaryPolling(meetingId, pollOwner ?? undefined);
 
     // Reset status to idle
     setSummaryStatus('idle');

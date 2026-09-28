@@ -42,7 +42,7 @@ interface SidebarContextType {
   // Summary polling management
   activeSummaryPolls: Map<string, NodeJS.Timeout>;
   startSummaryPolling: (meetingId: string, processId: string, onUpdate: (result: any) => void) => void;
-  stopSummaryPolling: (meetingId: string) => void;
+  stopSummaryPolling: (meetingId: string, processId?: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
 
@@ -72,6 +72,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   // — auto-summary finished on the backend but the UI never received it.
   const activeSummaryPollsRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
   const summaryPollGenerationRef = useRef<Map<string, number>>(new Map());
+  const summaryPollOwnersRef = useRef<Map<string, string>>(new Map());
   const [activeSummaryPolls, setActiveSummaryPolls] = useState<Map<string, NodeJS.Timeout>>(new Map());
 
   // Use recording state from RecordingStateContext (single source of truth)
@@ -174,6 +175,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
   // Summary polling management
   const clearPoll = useCallback((meetingId: string) => {
+    summaryPollOwnersRef.current.delete(meetingId);
     summaryPollGenerationRef.current.set(
       meetingId,
       (summaryPollGenerationRef.current.get(meetingId) ?? 0) + 1
@@ -193,6 +195,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   ) => {
     // Stop existing poll for this meeting if any
     clearPoll(meetingId);
+    summaryPollOwnersRef.current.set(meetingId, processId);
     const pollGeneration = summaryPollGenerationRef.current.get(meetingId) ?? 0;
     const isCurrentPoll = () =>
       summaryPollGenerationRef.current.get(meetingId) === pollGeneration;
@@ -202,9 +205,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     let pollCount = 0;
     const MAX_POLLS = 200; // ~16.5 minutes at 5-second intervals
     let stopped = false;
+    let inFlight = false;
 
     const tick = async () => {
-      if (stopped || !isCurrentPoll()) return;
+      if (stopped || inFlight || !isCurrentPoll()) return;
       pollCount++;
 
       if (pollCount >= MAX_POLLS) {
@@ -218,6 +222,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
+      inFlight = true;
       try {
         const result = await invoke('api_get_summary', {
           meetingId: meetingId,
@@ -227,6 +232,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         console.log(`📊 Polling update for ${meetingId}:`, result.status);
 
         onUpdate(result);
+        if (!isCurrentPoll()) return;
 
         const status = (result.status || '').toLowerCase();
         const terminal =
@@ -253,6 +259,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         });
         stopped = true;
         clearPoll(meetingId);
+      } finally {
+        inFlight = false;
       }
     };
 
@@ -263,7 +271,8 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     setActiveSummaryPolls(new Map(activeSummaryPollsRef.current));
   }, [clearPoll]);
 
-  const stopSummaryPolling = useCallback((meetingId: string) => {
+  const stopSummaryPolling = useCallback((meetingId: string, processId?: string) => {
+    if (processId && summaryPollOwnersRef.current.get(meetingId) !== processId) return;
     if (activeSummaryPollsRef.current.has(meetingId)) {
       console.log(`⏹️ Stopping polling for meeting ${meetingId}`);
       clearPoll(meetingId);
@@ -274,9 +283,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     return () => {
       console.log('🧹 Cleaning up all summary polling intervals');
-      activeSummaryPolls.forEach(interval => clearInterval(interval));
+      for (const [meetingId, interval] of activeSummaryPollsRef.current) {
+        clearInterval(interval);
+        summaryPollGenerationRef.current.set(meetingId, (summaryPollGenerationRef.current.get(meetingId) ?? 0) + 1);
+      }
+      activeSummaryPollsRef.current.clear();
+      summaryPollOwnersRef.current.clear();
     };
-  }, [activeSummaryPolls]);
+  }, []);
 
 
 

@@ -20,13 +20,21 @@ This fork also goes beyond removing feature restrictions. It adds speaker identi
 
 ## Latest Release
 
-Meetily `v0.2.15` keeps meeting controls accessible in narrow panels, fixes
-disconnected-device pickers and native dark-mode controls, and adds configurable
-Claude summary output budgets with explicit truncation errors. It retains the
-Windows long-recording crash fix from v0.2.14.
-[Read the v0.2.15 changelog](CHANGELOG.md).
+Meetily `v0.2.17` introduces optional **Nemotron-3 speaker diarization**, including
+live remote-speaker labels and post-call refinement. Windows uses DirectML
+acceleration where available, with CPU fallback. Optional setup downloads run in
+the background, and Nemotron enables automatically after a successful download.
+
+Thanks to **[@ampersandru](https://github.com/ampersandru)** for
+[PR #34](https://github.com/TylerBuza/Meetily-ActuallyFree/pull/34), the starting
+point for this integration. This release also includes model-download and setup
+reliability fixes. [Read the v0.2.17 changelog](CHANGELOG.md).
 
 ## Feature Comparison
+
+**For contributors and coding agents:** see the [development architecture map](docs/DEVELOPMENT_MAP.md)
+for recording/speaker data flow, lifecycle constraints, test entry points, and
+linked implementation notes. Repository working conventions are in [AGENTS.md](AGENTS.md).
 
 Compared with Meetily Community `v0.4.0` and the PRO advantages advertised on its project page (verified August 2026).
 

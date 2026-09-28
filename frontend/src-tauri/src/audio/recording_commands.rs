@@ -33,6 +33,18 @@ use super::transcription::{
 // Re-export TranscriptUpdate for backward compatibility
 pub use super::transcription::TranscriptUpdate;
 
+async fn start_live_diarization<R: Runtime>(app: &AppHandle<R>) {
+    let handle = app.clone();
+    let result = tokio::task::spawn_blocking(move || crate::diarization::online::start(handle)).await;
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.to_string(),
+        Err(error) => error.to_string(),
+    };
+    warn!("Live speaker identification unavailable: {error}");
+    let _ = app.emit("live-diarization-error", format!("Live speaker labeling is unavailable: {error}. Transcription will use source labels."));
+}
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
@@ -122,6 +134,16 @@ fn install_fatal_error_callback<R: Runtime>(
     });
 }
 
+fn map_recording_start_error<R: Runtime>(app: &AppHandle<R>, error: anyhow::Error) -> String {
+    crate::tray::update_tray_menu(app);
+    if error.downcast_ref::<crate::onnx_runtime::InitializationError>().is_some() {
+        log::error!("Transcription runtime startup failed: {error:#}");
+        format!("{}: Speech recognition could not initialize. Restart Meetily; if it continues, repair or reinstall the app.", crate::onnx_runtime::START_ERROR_CODE)
+    } else {
+        format!("Failed to start recording: {error}")
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn start_windows_audio_route_monitor<R: Runtime>(
     app: &AppHandle<R>,
@@ -206,6 +228,9 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    crate::onnx_runtime::ensure_available().map_err(|error| {
+        map_recording_start_error(&app, crate::onnx_runtime::InitializationError(error).into())
+    })?;
     // Validate that transcription models are available before starting recording
     info!("ðŸ” Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -402,13 +427,14 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Live audio-level meter: forward per-source (mic + system) levels to the UI visualizer
     let level_sender = spawn_level_forwarder(&app);
 
+    start_live_diarization(&app).await;
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     #[cfg(target_os = "windows")]
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
     let transcription_receiver = manager
         .start_recording(microphone_device, system_device, auto_save, Some(level_sender))
         .await
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
+        .map_err(|error| { crate::diarization::online::stop(); map_recording_start_error(&app, error) })?;
 
     #[cfg(target_os = "windows")]
     start_windows_audio_route_monitor(&app, &manager, resolved_system_device_name);
@@ -426,9 +452,6 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     // Live speaker identification: label transcript segments with individual
     // voices as they arrive. Best-effort — if the models aren't installed we
     // simply fall back to capture-source labels.
-    if let Err(e) = crate::diarization::online::start() {
-        info!("Live speaker identification unavailable: {}", e);
-    }
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
@@ -540,6 +563,9 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
+    crate::onnx_runtime::ensure_available().map_err(|error| {
+        map_recording_start_error(&app, crate::onnx_runtime::InitializationError(error).into())
+    })?;
     // Validate that transcription models are available before starting recording
     info!("ðŸ” Validating transcription model availability before starting recording...");
     if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
@@ -653,13 +679,14 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Live audio-level meter: forward per-source (mic + system) levels to the UI visualizer
     let level_sender = spawn_level_forwarder(&app);
 
+    start_live_diarization(&app).await;
     // Start recording with specified devices and auto_save setting
     #[cfg(target_os = "windows")]
     let resolved_system_device_name = system_device.as_ref().map(|device| device.name.clone());
     let transcription_receiver = manager
         .start_recording(mic_device, system_device, auto_save, Some(level_sender))
         .await
-        .map_err(|e| format!("Failed to start recording: {}", e))?;
+        .map_err(|error| { crate::diarization::online::stop(); map_recording_start_error(&app, error) })?;
 
     #[cfg(target_os = "windows")]
     start_windows_audio_route_monitor(&app, &manager, resolved_system_device_name);
@@ -677,9 +704,6 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     // Live speaker identification: label transcript segments with individual
     // voices as they arrive. Best-effort — if the models aren't installed we
     // simply fall back to capture-source labels.
-    if let Err(e) = crate::diarization::online::start() {
-        info!("Live speaker identification unavailable: {}", e);
-    }
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle

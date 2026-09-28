@@ -72,11 +72,6 @@ impl RecordingManager {
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
-        // Pipeline will mix mic + system audio professionally and send to this channel
-        // Pass auto_save to control whether audio checkpoints are created
-        let recording_sender = self.recording_saver.start_accumulation(auto_save)?;
-
         // Start recording state first
         self.state.start_recording()?;
 
@@ -98,27 +93,30 @@ impl RecordingManager {
             ("No System Audio".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
-        // Update recording metadata with device information
-        self.recording_saver.set_device_info(
-            microphone_device.as_ref().map(|d| d.name.clone()),
-            system_device.as_ref().map(|d| d.name.clone())
-        );
-
         // Start the audio processing pipeline with FFmpeg adaptive mixer
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
-        self.pipeline_manager.start(
+        let saver = &mut self.recording_saver;
+        if let Err(error) = self.pipeline_manager.start(
             self.state.clone(),
             transcription_sender,
             0, // Ignored - using dynamic sizing internally
             48000, // 48kHz sample rate
-            Some(recording_sender), // CRITICAL: Pass recording sender to receive pre-mixed audio
+            || saver.start_accumulation(auto_save),
             mic_name,
             mic_kind,
             sys_name,
             sys_kind,
             level_sender, // Live per-source level meter for the frontend visualizer
-        )?;
+        ) {
+            self.state.stop_recording();
+            self.state.cleanup();
+            return Err(error);
+        }
+        self.recording_saver.set_device_info(
+            microphone_device.as_ref().map(|d| d.name.clone()),
+            system_device.as_ref().map(|d| d.name.clone())
+        );
 
         // Give the pipeline a moment to fully initialize before starting streams
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
