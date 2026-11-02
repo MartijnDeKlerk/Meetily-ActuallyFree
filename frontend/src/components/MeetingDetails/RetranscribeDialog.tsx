@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu, BookOpen } from 'lucide-react';
+import { Spinner } from '@/components/ui/spinner';
+import { RefreshCw, Globe,  AlertCircle, CheckCircle2, X, Cpu, BookOpen } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -25,6 +26,7 @@ import { useRouter } from 'next/navigation';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import Analytics from '@/lib/analytics';
+import { announceChange } from '@/lib/workspace-api';
 
 interface RetranscribeDialogProps {
   open: boolean;
@@ -53,7 +55,7 @@ interface RetranscriptionError {
   error: string;
 }
 
-interface WhisperVocabularyConfig {
+interface VocabularyConfig {
   global: string;
   meeting: string;
 }
@@ -153,7 +155,7 @@ export function RetranscribeDialog({
           console.error('Failed to load post-call transcription config:', loadError);
           return fetchModels();
         });
-      invoke<WhisperVocabularyConfig>('api_get_whisper_vocabulary', { meetingId })
+      invoke<VocabularyConfig>('api_get_vocabulary', { meetingId })
         .then((config) => setSavedMeetingVocabulary(config.meeting || ''))
         .catch((loadError) => console.error('Failed to load meeting vocabulary:', loadError));
     }
@@ -201,6 +203,7 @@ export function RetranscribeDialog({
             toast.success(
               `Retranscription complete! ${event.payload.segments_count} segments created.`
             );
+            announceChange('people');
             onCompleteRef.current?.();
             onOpenChangeRef.current(false);
           }
@@ -276,8 +279,8 @@ export function RetranscribeDialog({
         language: languageToSend,
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
-        vocabularyTerms: isParakeetModel ? null : vocabularyTerms.trim() || null,
-        vocabularyScope: isParakeetModel ? null : vocabularyScope,
+        vocabularyTerms: vocabularyTerms.trim() || null,
+        vocabularyScope,
       });
     } catch (err: any) {
       setIsProcessing(false);
@@ -305,7 +308,7 @@ export function RetranscribeDialog({
   const clearMeetingVocabulary = async () => {
     setIsClearingMeetingVocabulary(true);
     try {
-      await invoke<string>('api_save_meeting_whisper_vocabulary', {
+      await invoke<string>('api_save_meeting_vocabulary', {
         meetingId,
         vocabulary: '',
       });
@@ -349,17 +352,17 @@ export function RetranscribeDialog({
           <DialogTitle className="flex items-center gap-2">
             {isProcessing ? (
               <>
-                <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
+                <Spinner className="h-5 w-5 text-af-accent" />
                 Retranscribing...
               </>
             ) : error ? (
               <>
-                <AlertCircle className="h-5 w-5 text-red-600" />
+                <AlertCircle className="h-5 w-5 text-af-danger" />
                 Retranscription Failed
               </>
             ) : (
               <>
-                <RefreshCw className="h-5 w-5 text-blue-600" />
+                <RefreshCw className="h-5 w-5 text-af-accent" />
                 Retranscribe Meeting
               </>
             )}
@@ -448,23 +451,23 @@ export function RetranscribeDialog({
                   <div className="rounded-md border border-border bg-muted/30 p-3">
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-medium">Parakeet</span>
-                      <span className={hasParakeetModel ? 'text-emerald-600' : 'text-muted-foreground'}>
+                      <span className={hasParakeetModel ? 'text-af-success' : 'text-muted-foreground'}>
                         {hasParakeetModel ? 'Installed' : 'Not installed'}
                       </span>
                     </div>
                     <p className="mt-1 text-muted-foreground">
-                      Faster and smaller with automatic language detection. Does not support vocabulary hints.
+                      Faster and smaller with automatic language detection and contextual vocabulary boosting.
                     </p>
                   </div>
                   <div className="rounded-md border border-border bg-muted/30 p-3">
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-medium">Whisper</span>
-                      <span className={hasWhisperModel ? 'text-emerald-600' : 'text-amber-600'}>
+                      <span className={hasWhisperModel ? 'text-af-success' : 'text-af-warning'}>
                         {hasWhisperModel ? 'Installed' : 'Optional'}
                       </span>
                     </div>
                     <p className="mt-1 text-muted-foreground">
-                      Better control for names and jargon, with vocabulary hints and manual language selection. Usually slower and larger.
+                      Manual language selection, vocabulary prompting, and broad language support. Usually slower and larger.
                     </p>
                     {!hasWhisperModel && (
                       <Button
@@ -483,7 +486,7 @@ export function RetranscribeDialog({
             </div>
           )}
 
-          {!isProcessing && !error && !isParakeetModel && (
+          {!isProcessing && !error && (
             <div className="space-y-3 rounded-lg border border-border p-3">
               <div className="flex items-center gap-2">
                 <BookOpen className="h-4 w-4 text-muted-foreground" />
@@ -497,7 +500,7 @@ export function RetranscribeDialog({
                 placeholder={'Participant names, company names, acronyms, or technical terms'}
               />
               <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>Meeting terms take priority within Whisper&apos;s prompt limit.</span>
+                <span>Terms are saved and applied by the selected transcription model.</span>
                 <span>{vocabularyTerms.length}/1000</span>
               </div>
               {vocabularyTerms.trim() && (
@@ -543,13 +546,13 @@ export function RetranscribeDialog({
           {isProcessing && progress && (
             <div className="space-y-2">
               <div className="relative">
-                <div className="w-full bg-gray-200 rounded-full h-3">
+                <div className="w-full bg-af-hover rounded-full h-3">
                   <div
-                    className="bg-blue-600 h-3 rounded-full transition-all duration-300 ease-out"
+                    className="bg-af-accent h-3 rounded-full transition-all duration-300 ease-out"
                     style={{ width: `${Math.min(progress.progress_percentage, 100)}%` }}
                   />
                 </div>
-                <div className="flex justify-between text-xs text-gray-600 mt-1">
+                <div className="flex justify-between text-xs text-af-text-2 mt-1">
                   <span>{progress.stage}</span>
                   <span>{Math.round(progress.progress_percentage)}%</span>
                 </div>
@@ -561,8 +564,8 @@ export function RetranscribeDialog({
           )}
 
           {error && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-              <p className="text-sm text-red-800">{error}</p>
+            <div className="bg-af-danger/10 border border-af-danger/35 rounded-lg p-3">
+              <p className="text-sm text-af-danger">{error}</p>
             </div>
           )}
         </div>
@@ -575,7 +578,7 @@ export function RetranscribeDialog({
               </Button>
               <Button
                 onClick={handleStartRetranscription}
-                className="bg-blue-600 hover:bg-blue-700"
+                className="bg-af-accent hover:bg-af-accent-hover"
                 disabled={!meetingFolderPath || !listenersReady || isClearingMeetingVocabulary || loadingModels || !selectedModelDetails}
               >
                 <RefreshCw className="h-4 w-4 mr-2" />

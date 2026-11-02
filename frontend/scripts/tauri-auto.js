@@ -40,6 +40,25 @@ console.log(''); // Empty line for spacing
 const platform = os.platform();
 const env = { ...process.env };
 
+// Ensure local node_modules/.bin is in PATH so tauri binary is always found
+const binDir = path.resolve(__dirname, '../node_modules/.bin');
+const pathKey = Object.keys(process.env).find(k => k.toLowerCase() === 'path') || 'PATH';
+env[pathKey] = `${binDir}${path.delimiter}${process.env[pathKey] || ''}`;
+
+if (platform === 'win32') {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const nsisDir = path.join(localAppData, 'tauri', 'NSIS');
+  if (fs.existsSync(nsisDir)) {
+    env[pathKey] = `${nsisDir}${path.delimiter}${env[pathKey]}`;
+  }
+  if (!env.LIBCLANG_PATH && fs.existsSync('C:\\Program Files\\LLVM\\bin')) {
+    env.LIBCLANG_PATH = 'C:\\Program Files\\LLVM\\bin';
+  }
+  if (!env.BINDGEN_EXTRA_CLANG_ARGS && fs.existsSync('C:\\Program Files\\LLVM\\lib\\clang\\18\\include')) {
+    env.BINDGEN_EXTRA_CLANG_ARGS = '-I"C:/Program Files/LLVM/lib/clang/18/include"';
+  }
+}
+
 if (platform === 'linux' && feature === 'hipblas') {
   // llama-cpp-sys requires ROCM_PATH/HIP_PATH to point to a directory
   // containing lib/. Fedora commonly installs ROCm under /usr/lib64/rocm.
@@ -99,11 +118,14 @@ if (platform === 'win32' && feature === 'cuda') {
 
 // Build the tauri command
 let tauriCmd = `tauri ${command}`;
+const extraArgs = process.argv.slice(3).join(' ');
 if (feature && feature !== 'none') {
   tauriCmd += ` -- --features ${feature}`;
-  console.log(`🚀 Running: tauri ${command} with features: ${feature}`);
+  if (extraArgs) tauriCmd += ` ${extraArgs}`;
+  console.log(`🚀 Running: ${tauriCmd}`);
 } else {
-  console.log(`🚀 Running: tauri ${command} (CPU-only mode)`);
+  if (extraArgs) tauriCmd += ` ${extraArgs}`;
+  console.log(`🚀 Running: ${tauriCmd} (CPU-only mode)`);
 }
 console.log('');
 

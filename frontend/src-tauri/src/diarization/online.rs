@@ -63,6 +63,9 @@ struct OnlineDiarizer {
     last_system_speaker: Option<usize>,
     /// Last speaker heard on the mic path.
     last_mic_speaker: Option<usize>,
+    profiles: Vec<super::voice_profiles::VoiceProfile>,
+    /// Set from a verified vector match, never from a meeting-local channel number.
+    names: Vec<Option<String>>,
 }
 
 impl OnlineDiarizer {
@@ -105,7 +108,11 @@ pub fn is_active() -> bool {
 pub fn start<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
     stop();
     if super::get_active_engine() == "nemotron" {
-        return super::live_nemotron::start(app);
+        super::live_nemotron::start(app)?;
+        if let Err(error) = super::voice_profiles::start_live_matcher() {
+            log::warn!("Named voice matching unavailable for this Nemotron session: {error}");
+        }
+        return Ok(());
     }
     if !super::pyannote_models_available() {
         return Err(anyhow!("diarization models not installed"));
@@ -121,6 +128,13 @@ pub fn start<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
         .map(|v| v.embedding)
         .filter(|e| !e.is_empty());
     let has_enrolled = enrolled.is_some();
+    let profiles = match super::voice_profiles::load_for_matching() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            log::warn!("Named voice profiles unavailable for this meeting: {error}");
+            Vec::new()
+        }
+    };
     *guard = Some(OnlineDiarizer {
         models,
         centroids: enrolled.into_iter().collect(),
@@ -129,6 +143,8 @@ pub fn start<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
         last_speaker: 0,
         last_system_speaker: None,
         last_mic_speaker: has_enrolled.then_some(0),
+        profiles,
+        names: if has_enrolled { vec![None] } else { Vec::new() },
     });
     log::info!(
         "🧑‍🤝‍🧑 Live speaker identification started (voiceprint={})",
@@ -140,6 +156,7 @@ pub fn start<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<()> {
 /// End the session and release the model.
 pub fn stop() {
     super::live_nemotron::stop();
+    super::voice_profiles::stop_live_matcher();
     if let Ok(mut guard) = ONLINE.lock() {
         if let Some(d) = guard.take() {
             log::info!(
@@ -156,6 +173,7 @@ pub struct LiveSpeaker {
     pub index: usize,
     /// Whether this speaker appears to be the local user (see `user_speaker`).
     pub is_user: bool,
+    pub profile_name: Option<String>,
 }
 
 /// Assign a 16 kHz mono speech segment to a live speaker.
@@ -182,6 +200,7 @@ pub fn assign_speaker(samples: &[f32], mic_dominant: bool) -> Option<LiveSpeaker
         return Some(LiveSpeaker {
             index,
             is_user: mic_dominant || is_user,
+            profile_name: if mic_dominant { None } else { d.names.get(index).cloned().flatten() },
         });
     }
 
@@ -197,6 +216,7 @@ pub fn assign_speaker(samples: &[f32], mic_dominant: bool) -> Option<LiveSpeaker
             return Some(LiveSpeaker {
                 index,
                 is_user: mic_dominant,
+                profile_name: if mic_dominant { None } else { d.names.get(index).cloned().flatten() },
             });
         }
     };
@@ -242,6 +262,7 @@ pub fn assign_speaker(samples: &[f32], mic_dominant: bool) -> Option<LiveSpeaker
         d.centroids.push(embedding);
         d.counts.push(1.0);
         d.mic_counts.push(0.0);
+        d.names.push(None);
         0
     } else if (1.0 - best_sim) <= threshold || d.centroids.len() >= MAX_LIVE_SPEAKERS {
         // Fold into the matched speaker as an incremental mean, then restore
@@ -262,6 +283,7 @@ pub fn assign_speaker(samples: &[f32], mic_dominant: bool) -> Option<LiveSpeaker
         d.centroids.push(embedding);
         d.counts.push(1.0);
         d.mic_counts.push(0.0);
+        d.names.push(None);
         log::info!(
             "🧑‍🤝‍🧑 Live diarization: new speaker {} detected (path={})",
             d.centroids.len(),
@@ -279,6 +301,10 @@ pub fn assign_speaker(samples: &[f32], mic_dominant: bool) -> Option<LiveSpeaker
     }
 
     d.last_speaker = speaker;
+    if !mic_dominant {
+        d.names[speaker] = super::voice_profiles::best_match(&d.centroids[speaker], &d.profiles)
+            .map(|profile| profile.name.clone());
+    }
     let user = d.user_speaker();
     // Mic path is always the local user for dual-path STT; system path never is.
     let is_user = mic_dominant || user == Some(speaker);
@@ -298,5 +324,6 @@ pub fn assign_speaker(samples: &[f32], mic_dominant: bool) -> Option<LiveSpeaker
     Some(LiveSpeaker {
         index: speaker,
         is_user,
+        profile_name: if mic_dominant { None } else { d.names[speaker].clone() },
     })
 }

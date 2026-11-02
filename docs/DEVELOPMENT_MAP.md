@@ -18,6 +18,85 @@ and a model's anonymous speaker channels are also different concepts.
 
 ## 2. Recording data flow
 
+Speech-start pre-roll, live system speech sensitivity, and real-call replay
+qualification are documented in [LIVE_SPEECH_RETENTION.md](LIVE_SPEECH_RETENTION.md).
+Sample continuity across jittered capture callbacks and issue #40 qualification
+are documented in [AUDIO_CALLBACK_CONTINUITY.md](AUDIO_CALLBACK_CONTINUITY.md).
+That note also covers the Windows/shared-mixer and macOS follow-ups for #42:
+Windows CPAL mic/system blocks and macOS CPAL mic blocks use bounded workers, with
+capture timestamps, queued mute state, and stop/drain ordering owned by
+`audio/stream.rs`, `audio/pipeline.rs`, and `audio/recording_manager.rs`.
+CPAL capture age is converted to block-end recording seconds before processing.
+The shared mixer uses its full 400 ms missing-source allowance and drains input
+before enforcing further waiting; it no longer pops queued samples off the front.
+Per-instance local logs count inserted silence and discarded late samples.
+Timeline resets save both pending source tails before replacing the mixer origin.
+Windows Stop gates new callbacks and bounds native cleanup to three seconds per
+stream; new capture is blocked while timed-out cleanup still owns a native stream.
+Twenty-two pipeline regressions passed on Windows, including ten-minute dual
+source skew/stall replays, bounded missing-source output, and queued mute state.
+The ignored `audio::pipeline::hardware_qualification` test opens explicitly named
+Windows endpoints and exercises the production mic worker, dual VAD, mixer, and
+native Stop without saving audio. See the continuity note for its opt-in command,
+results, and limitations (especially silent microphones and omitted ASR).
+The corrected 11-minute G733 capture-only soak passed with 35 ms native Stop and
+all nonzero system samples preserved. The microphone supplied silence; speech
+retention remains unqualified. The native suite passed 370 tests (ten opt-in tests
+ignored normally), including 22 pipeline and eight worker regressions.
+Published previews predate these corrections; see the linked continuity note
+for verification and limits.
+The #42 follow-up uses `audio/capture_worker.rs` for explicit close/drain and a
+bounded wait independent of retained native callbacks. Its five std-only
+regressions passed on synthetic inputs; physical Mac Stop, missing microphone
+audio, and live-text gaps remain unqualified (see the linked continuity note).
+`AudioMixerRingBuffer` also recovers a source clock left behind emitted silence
+or a full-window callback loss, but only once fresh capture timestamps reach the
+un-emitted timeline. Old queued frames still cannot overwrite saved silence.
+All 17 native pipeline regressions passed on Windows. Mac candidate builds run
+worker and source-continuity regressions before upload.
+The separate macOS system tap in `audio/capture/core_audio.rs` now survives
+ring-buffer pressure and closes its async wake registration race; neither path
+has a physical macOS reproduction/qualification yet. Its aggregate device keeps
+`tapautostart` off: with it on, the HAL ran no IO until something played, so a
+meeting started in silence stopped after five seconds (issue #42; physical
+reproduction and local fix check in [OCTOBER_PR_INTEGRATION.md](OCTOBER_PR_INTEGRATION.md)).
+A later tap stall warns the user (`RecordingState::report_warning` →
+`recording-audio-route-warning`) and keeps the microphone recording.
+The home screen's macOS computer-audio banner (`hooks/usePermissionCheck.ts`,
+`components/PermissionWarning.tsx`) reads Audio Capture authorization from TCC
+through `get_system_audio_permission_status` in `audio/permissions.rs`. That uses
+the private `TCCAccessPreflight`, resolved with `dlopen` at runtime, because Apple
+has no public query and a tap returns zeros both when denied and in silence.
+Granted means no banner, with no audible proof needed on each launch. Denied and
+not-yet-asked get their own advice. TCC answers from a per-process cache: on
+macOS 26.6.2 a grant from the prompt that "Check again" triggers kept reading
+not-yet-asked in that process until restart (checked with an ad-hoc build).
+Readable permission states are therefore asked again in a short-lived copy of the
+app binary. `main.rs` handles `--audio-capture-status` by printing the code and
+exiting before Tauri starts. Audible samples from the session-scoped probe also
+clear the banner unless TCC explicitly denies access. If the symbol is missing,
+the status is `unknown` and only the probe decides. Covered by
+`tests/hooks/permission-check.test.tsx` and two native tests in `permissions.rs`;
+the native check that the symbol resolves only runs on macOS.
+
+October 22 follow-up: all readable TCC states, including granted, are rechecked
+in the short-lived helper to avoid trusting a cached grant after revocation.
+An explicit denial clears earlier session probe evidence; unknown status retains
+the audible-probe fallback. Candidate CI tests the packaged helper with a timeout
+and runs the full native library suite. See [MACOS_OCT22_STABILITY.md](MACOS_OCT22_STABILITY.md).
+`frontend/src/app/layout.tsx` now loads packaged Inter font files from
+`@fontsource-variable/inter` rather than fetching Google CSS during a Next
+production build. `globals.css` owns `--font-sans`, and `frontend/pnpm-lock.yaml`
+pins the bundled font package; this removes a network-dependent build step.
+
+Meeting details layout lives in `frontend/src/app/meeting-details/page-content.tsx`:
+the transcript/notes separator stores its width locally and supports pointer and
+keyboard resizing. Pane stacking now responds to the actual content width (which
+the sidebar can reduce), not just viewport width; this retains the minimum
+transcript and notes widths from issue #25. The existing wrapped toolbars and
+Export access remain in `components/meeting/MeetingHeader.tsx` and
+`MeetingDocument.tsx`. Narrow-content browser checks are still required.
+
 ```text
 recording_commands.rs: start command
   -> initialize selected live diarizer before capture (blocking work off Tokio)
@@ -96,13 +175,21 @@ source labels rather than guessing a speaker or switching engines.
 
 ## 3. Post-call processing and model selection
 
+Summary-generated title ownership, placeholder rejection and completion refresh
+are documented in [SUMMARY_GENERATED_TITLES.md](SUMMARY_GENERATED_TITLES.md).
+
 `diarization/mod.rs` owns persisted engine settings and offline command dispatch.
 Nemotron is Auto-detect only; manual counts belong to Pyannote. Rerunning speaker
 identification must preserve transcript text, row identity, and timestamps.
 Read [PR34_NEMOTRON.md](PR34_NEMOTRON.md) before changing that contract.
 
 Frontend post-call sequencing lives in
-`frontend/src/components/MeetingDetails/PostCallProcessingDialog.tsx` and related
+`frontend/src/components/MeetingDetails/PostCallProcessingWorker.tsx`, owned above
+navigation by `frontend/src/contexts/PostCallJobsContext.tsx`. The page's
+`PostCallProcessingDialog.tsx` registers/detaches only its view. Completion and
+transcript refresh target the matching mounted meeting; inactive meetings refresh
+on return. See [OCTOBER_PR_INTEGRATION.md](OCTOBER_PR_INTEGRATION.md) for cancellation
+ownership and lifecycle limits. Related
 speaker/retranscription dialogs. `useDiarizationEngine.ts` refreshes selected-engine
 state for dialogs, including native activation events and stale-response guards.
 
@@ -111,9 +198,37 @@ saves the **post-call** default; it must not replace the live Parakeet selection
 
 ## 4. Optional download ownership and UI synchronization
 
+### October integration interfaces
+
+- `speakerUtils.ts` splits overlap labels for display and live aliases. Native
+  `PeopleRepository` renames exact components transactionally; optional `from` on
+  `reassign_transcript_speaker` selects one component without losing other voices.
+  Speaker edits preserve transcript rows, text, timestamps, and source provenance.
+  Coverage: `combined-speakers`, `combined-speaker-edit`, `live-speaker-edits`, and
+  the native person-repository regressions.
+- Markdown export uses `exportMarkdownFrontmatter.ts` and the current
+  `useCopyOperations` hook. Named overlap components get separate optional links;
+  generic labels do not become contacts. Other formats retain their old rendering.
+- Vocabulary IPC names are now model-neutral (`api_get_vocabulary`,
+  `api_save_global_vocabulary`, `api_save_meeting_vocabulary`). Existing vocabulary
+  database tables remain. `parakeet_engine/model.rs` owns glossary token boosts and
+  post-decode canonicalization; the seven synthetic regressions are not speech
+  accuracy qualification. Import/live/post-call paths pass the saved glossary.
+- Linux source builds map transcription `hipblas` to llama-helper `rocm` and
+  resolve distro-specific SDK paths. Four ROCm parser regressions and normalized
+  shell syntax checks ran; actual AMD build/inference did not.
+
+See [OCTOBER_PR_INTEGRATION.md](OCTOBER_PR_INTEGRATION.md) for reviewed but blocked
+PR #22/#38, qualification, and release status. The integrated shared changes are
+included in Windows v0.2.23; published v0.2.20 installers do not contain them.
+
 `frontend/src/contexts/OptionalModelDownloadsContext.tsx` owns optional jobs above
 onboarding and Settings so normal navigation does not cancel them. This is not an
 OS background service. An app exit and a WebView reload are different lifetimes.
+The top-right `DownloadProgressToastProvider` consumes these same jobs alongside
+Parakeet/summary transfers, including verification and activation progress; it
+does not start downloads or duplicate optional completion notifications. See
+`tests/download-progress/background.test.tsx` for the panel/provider integration.
 
 For Nemotron, `download_diarization_models` in `diarization/mod.rs` performs the
 verified download **and persists engine activation in native code**. On success
@@ -128,8 +243,10 @@ different transports; neither is itself the persisted source of truth.
 Read [NEMOTRON_NATIVE_ACTIVATION.md](NEMOTRON_NATIVE_ACTIVATION.md) for the regression
 and installed-app test. Read [V0219_BACKGROUND_SETUP.md](V0219_BACKGROUND_SETUP.md)
 and [V0220_OPTIONAL_ACTIVATION.md](V0220_OPTIONAL_ACTIVATION.md) as historical notes;
-later fixes supersede earlier behavior. Whisper still has a frontend completion/
-activation path: do not infer that Nemotron's native-lifetime fix covers it too.
+later fixes supersede earlier behavior. The post-v0.2.18 follow-up moves optional
+Whisper activation into `whisper_download_model(enablePostCall=true)` and adds
+native `uninstall_optional_model` ownership in `optional_models.rs`; see the
+updated native-activation note for locking, settings events, tests, and limits.
 
 ## 5. Acceleration and packaging are separate from ASR selection
 
@@ -139,19 +256,151 @@ Whisper's CUDA/Vulkan/CPU backend selection. Read `onnx_runtime.rs`,
 `frontend/src-tauri/build/onnxruntime.rs`, and the Sortformer session builder before
 changing runtime loading or execution-provider settings.
 
+Labs Parakeet GPU acceleration is a separate native preference in
+`parakeet_engine/labs.rs`. It reloads the selected Parakeet model and places the
+encoder session on DirectML device 0; the decoder and preprocessor remain on
+CPU. Provider initialization errors are reported to Settings and the prior
+preference/model is restored. This does not change Nemotron or Whisper's
+backend. `get_local_stack_status` reports the native preference to the Local
+stack UI; its previous Parakeet CPU pill was fixed text. An ignored test with
+the installed v3 INT8 model and synthetic silence confirms encoder nodes run
+on both DirectML and CPU; real speech performance remains unqualified.
+
 The universal Windows build script is
 `frontend/scripts/build-universal-windows.ps1`. It packages CPU/Vulkan/CUDA app
 variants; the runtime payload must match the one validated in tests. Validate with
 `node frontend/scripts/verify-windows-release.mjs`.
+The packager reads release notes with .NET `ReadAllText` so Windows PowerShell
+does not attach provider/filesystem metadata to updater `notes`. The payload
+verifier requires `notes` to be a string. This was caught during v0.2.18 draft
+preparation; the manifest/checksums were regenerated and reverified without
+changing the signed executable payloads.
 
 ## 6. Tests, qualification, and historical notes
 
-From `frontend/`, run mock-heavy groups separately:
+Crash diagnostics are mapped in [ARCHITECTURE.md](../ARCHITECTURE.md#crash-reports).
+`src-tauri/src/diagnostics.rs` persists a bounded native lifecycle timeline for the
+next crash ZIP; `crash_report.rs` owns session recovery and export. Run native
+`diagnostics::tests` and `crash_report::tests` for timeline/privacy/rollover coverage.
+October 28 verification: the targeted Windows CPU native invocation passed 14
+tests (13 journal/crash-report tests plus the existing audio diagnostic test).
+It used MSVC and LLVM 18/libclang; local LLVM 22 produced invalid opaque Whisper
+bindings, so the Whisper build cache was regenerated with LLVM 18. TypeScript
+5.9.3 checking passed using a clean pnpm dlx compiler because the local compiler
+package was incomplete. Three isolated combined-speaker/edit/export frontend
+files also passed all 14 tests while rechecking #44. These were synthetic/temp-file
+tests, not a real Teams/Vulkan freeze reproduction or physical Mac qualification.
+Windows v0.2.23 now includes these diagnostics. The full candidate suite passed
+389 native tests (ten ignored) and all 34 isolated frontend test files. Packaging,
+local upgrade, two launches, persisted startup events, and clean exits passed;
+see [RELEASE_V0223_QUALIFICATION.md](RELEASE_V0223_QUALIFICATION.md) for preservation
+checks, source/hash provenance, and publication verification.
+
+macOS publication supports an explicitly labeled CI-qualified preview via
+`publish-macos.yml` (`preview=true`). It records no physical-test attestation,
+publishes a separate non-Latest prerelease, and retains artifact/hash/source
+provenance and public launch checks. Stable publication still requires the
+physical checklist. Documentation/publishing-only commits may follow a candidate;
+application, dependency, and build-workflow changes require a new candidate.
+See `.github/workflows/MACOS_RELEASE.md` for dispatch and remaining limitations.
+The `v0.2.19-macos` preview packages the #42 callback change; build
+`36790029640` and published-asset smoke test `36790877680` passed. It remains
+unqualified for physical microphone capture and the reporter's device. The
+Windows v0.2.20 release is documented in
+[RELEASE_V0220_QUALIFICATION.md](RELEASE_V0220_QUALIFICATION.md) for Windows build,
+hardware-capture, installed-upgrade, and public updater verification.
+The current Windows Latest is v0.2.23, qualified separately as linked above.
+The `v0.2.20-macos` follow-up packages explicit worker shutdown and short-gap
+source recovery for #42. Apple Silicon build `36876715270` passed all 22 worker
+and pipeline regressions plus bundle/launch checks; public smoke test
+`36878960910` passed. See [RELEASE_V0220_MACOS.md](RELEASE_V0220_MACOS.md) for
+provenance. Physical recording and live-transcription confirmation remain open.
+The Windows VirusTotal submission normalizes CRLF checksum manifests before
+filename matching and Linux checksum verification.
+
+Live system-meter warnings are documented in
+[SYSTEM_AUDIO_LEVEL_ADVICE.md](SYSTEM_AUDIO_LEVEL_ADVICE.md).
+
+See [PR39_INTEGRATION.md](PR39_INTEGRATION.md) for capture-readiness, setup
+gating, quiet-speech and meeting-scoped speaker-edit recovery corrections.
+
+### Home meeting library
+
+`components/Sidebar/index.tsx` renders the text-only **Meetily · Actually Free**
+wordmark, with the original blue/soft-blue colors on one line. It opens About;
+the adjacent collapse control remains separate. The 16px wordmark was visually
+checked in browser preview at the default 256px rail width (no clipping or
+overlap), and the production frontend build/type validation passed.
+The rebuilt v0.2.18 Windows package passed payload/signature verification and was
+installed locally; the installed CUDA executable matched its packaged hash.
+Installed-WebView inspection confirmed the single-line text, 16px size, no image,
+and no overlap with Collapse. Startup, Nemotron availability, database integrity,
+all six meetings/68 transcript rows, model hashes and preference values were
+verified after upgrade. The app was reopened normally; this is not a publication.
+
+`frontend/src/app/home/page.tsx` renders the date-sorted meeting library and is
+the Tauri startup route (`/home`). The recording-ready screen remains `/`; the
+sidebar's New Recording action opens it. `SidebarProvider` owns the shared meeting
+list and refresh/error state. `api_get_meetings` in `api/api.rs` batches saved
+summaries and transcript labels, returning raw summary data, a plain-text preview,
+and distinct custom speaker names in first-spoken order alongside date/duration.
+Generated/source labels are excluded using `is_person_name`; these names are only
+meeting display snapshots, not inferred cross-meeting identities. Home and meeting
+details share the legacy/Markdown/BlockNote topic classifier in
+`frontend/src/lib/summary-buckets.ts`. Home groups full-width meeting cards by
+local date, connects each day's cards with a timeline, and filters title, named
+participants, summary, and topics with the search field. Cards show a short
+summary paragraph and at most three short Key Topics labels. Topic bullets with
+label/explanation markup display only the label; the full summary is retained.
+Missing summaries remain an explicit empty state. Cards link to the existing meeting detail route; Home
+refreshes its list on entry after a summary is saved. `StartupTranscriptRecovery`
+now mounts in the shared layout so IndexedDB recovery checks still run when Home
+opens first. Tray/notification start events from Home route to `/` with the
+auto-start flag for the recording hook. Topic extraction remains heuristic and
+depends on a recognizable Key Topics heading or legacy section. Verification
+covers frontend/native builds and the Windows installer payload; a local installer
+is not a published release.
+
+### Speaker colors in transcripts
+
+`speakerUtils.ts` supplies the shared dot/text palette for the live and post-call
+virtualized transcript, the live speakers list, the person card and the identify
+dialog. The Tailwind scan must include `src/utils`, where the palette class names
+are declared, or named speakers can render without a dot or text color in
+production. A named person is drawn in their avatar's colour (`colorForName`),
+so they look the same in the transcript, the meeting header and their contact
+page; their transcript bubbles take a faint wash of it (`.af-speaker-bubble`).
+Unnamed voices ("Speaker 2") get palette slots by first-spoken meeting order, so
+they stay apart until identified; `You` uses the theme accent. The palette has
+eight slots, so meetings with more than eight unnamed voices reuse colors.
+The focused `tests/lib/speaker-colors.test.mjs` checks slot continuity and the
+contact colour; the Next production CSS output must also contain every dot
+palette class.
+
+Labs roadmap features 1, 3, 7, 8, and 12 are mapped in
+[LABS_MACWHISPER_FEATURES.md](LABS_MACWHISPER_FEATURES.md). Read it before
+changing meeting detection, recorded audio seeking, named voice enrollment,
+Whisper silence thresholds, or the clean transcript display. Settings > Labs
+holds the switches (`LabsSettings.tsx`, `lib/labs-features.ts`); the Whisper,
+voice-profile and Parakeet GPU switches also persist in native app data so they
+survive a WebView reload. Each feature also appears where it is used: the
+automation switch in Meeting detection, the waveform, slower speeds and
+Clean/Verbatim switch in the meeting player, voices on each contact's page and
+in the speaker card, and per-app capture (not a Labs feature) in Settings >
+Recording and the record card's system audio panel. Named profiles use
+WeSpeaker embeddings in Pyannote live sessions and as a separate identity
+matcher for Nemotron live and both post-call paths. Nemotron remains the selected
+diarizer; its channel numbers never establish persistent identity.
+
+From `frontend/`, run all frontend test files in separate Bun processes. The
+portable runner discovers `tests/**/*.test.{js,mjs,ts,tsx}` and fails if any file
+fails. CI uses the same command, including optional-download, diarization, Labs,
+and audio-level lifecycle tests. Isolation is required: summary-language tests
+define a read-only `window`, while meeting-automation tests install their own
+window; combining them in one Bun process caused repeated CI failures.
 
 ```text
-pnpm dlx bun@1.3.10 test tests/optional-downloads/background.test.tsx
-pnpm dlx bun@1.3.10 test tests/diarization/engine-selection.test.tsx
-pnpm dlx bun@1.3.10 test tests/hooks
+pnpm dlx bun@1.3.10 scripts/test-isolated.mjs
 pnpm run build
 ```
 

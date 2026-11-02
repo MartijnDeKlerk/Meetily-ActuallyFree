@@ -18,6 +18,7 @@
 //! - `commands`: Tauri command interface for frontend integration
 
 pub mod parakeet_engine;
+pub mod labs;
 pub mod model;
 pub mod commands;
 mod download_response;

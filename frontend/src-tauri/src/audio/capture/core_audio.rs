@@ -40,6 +40,7 @@ pub struct CoreAudioStream {
     _tap: ca::TapGuard,
     waker_state: Arc<Mutex<WakerState>>,
     current_sample_rate: Arc<AtomicU32>,
+    last_drop_log: Instant,
 }
 
 /// Audio processing context
@@ -49,7 +50,7 @@ struct AudioContext {
     producer: HeapProd<f32>,
     waker_state: Arc<Mutex<WakerState>>,
     current_sample_rate: Arc<AtomicU32>,
-    consecutive_drops: Arc<AtomicU32>,
+    dropped_samples: AtomicU32,
     should_terminate: Arc<AtomicBool>,
 }
 
@@ -57,7 +58,12 @@ struct AudioContext {
 impl CoreAudioCapture {
     /// Create a new Core Audio capture for system audio
     pub fn new() -> Result<Self> {
-        info!("🎙️ CoreAudio: Starting Core Audio capture initialization...");
+        Self::new_with_process(None)
+    }
+
+    /// Create a new Core Audio capture targeting a specific process or global audio
+    pub fn new_with_process(target_pid: Option<u32>) -> Result<Self> {
+        info!("🎙️ CoreAudio: Starting Core Audio capture initialization (target_pid: {:?})...", target_pid);
 
         // Audio Capture permission (NSAudioCaptureUsageDescription) is required.
         // The permission dialog is automatically triggered when creating the Core Audio tap.
@@ -87,11 +93,26 @@ impl CoreAudioCapture {
         // When using a tap, the tap provides all the audio we need
         // Including both the tap AND the device creates duplicate audio (echo issue)
 
-        // Create process tap with mono global tap, excluding no processes
-        // Note: Mono tap is more reliable for system audio capture on macOS
-        info!("🎙️ CoreAudio: Creating process tap (global mono tap)...");
-        let tap_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new());
+        let tap_desc = if let Some(pid) = target_pid {
+            info!("🎙️ CoreAudio: Creating process tap for target PID {}...", pid);
+            let num = cidre::ns::Number::with_i32(pid as i32);
+            let arr = cidre::ns::Array::from_slice(&[&*num]);
+            ca::TapDesc::with_mono_mixdown_of_processes(&arr)
+        } else {
+            info!("🎙️ CoreAudio: Creating process tap (global mono tap)...");
+            ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new())
+        };
+
         let tap = tap_desc.create_process_tap()
+            .or_else(|err| {
+                if target_pid.is_some() {
+                    warn!("⚠️ CoreAudio: Per-process tap failed ({:?}), falling back to global tap...", err);
+                    let fallback_desc = ca::TapDesc::with_mono_global_tap_excluding_processes(&cidre::ns::Array::new());
+                    fallback_desc.create_process_tap()
+                } else {
+                    Err(err)
+                }
+            })
             .map_err(|e| {
                 error!("❌ CoreAudio: Failed to create process tap: {:?}", e);
                 anyhow::anyhow!("Failed to create process tap: {:?}", e)
@@ -123,6 +144,12 @@ impl CoreAudioCapture {
         // Previous configuration included both sub_device_list (output device) and tap_list (tap of same device)
         // This caused duplicate audio capture, resulting in echo (YouTube audio appeared twice)
         // The tap alone provides all the system audio we need
+        //
+        // Tap auto-start must stay off (issue #42). With it on, AudioDeviceStart
+        // returns noErr but the HAL defers all IO until a tapped process plays
+        // audio, so a meeting that starts in silence delivers no callbacks and
+        // trips the stream's five-second inactivity check. Off, the tap runs
+        // immediately and delivers zeros during silence.
         let agg_desc = cf::DictionaryOf::with_keys_values(
             &[
                 ca::aggregate_device_keys::is_private(),
@@ -137,7 +164,7 @@ impl CoreAudioCapture {
             &[
                 cf::Boolean::value_true().as_type_ref(),
                 cf::Boolean::value_false(),
-                cf::Boolean::value_true(),
+                cf::Boolean::value_false(), // tap auto-start; see above
                 cf::str!(c"meetily-audio-tap").as_type_ref(),
                 &output_uid,
                 &cf::Uuid::new().to_cf_string(),
@@ -277,7 +304,7 @@ impl CoreAudioCapture {
             producer,
             waker_state: waker_state.clone(),
             current_sample_rate: current_sample_rate.clone(),
-            consecutive_drops: Arc::new(AtomicU32::new(0)),
+            dropped_samples: AtomicU32::new(0),
             should_terminate: Arc::new(AtomicBool::new(false)),
         });
 
@@ -293,6 +320,7 @@ impl CoreAudioCapture {
             _tap: self.tap,
             waker_state,
             current_sample_rate,
+            last_drop_log: Instant::now(),
         })
     }
 
@@ -339,14 +367,9 @@ fn process_audio_data(ctx: &mut AudioContext, data: &[f32]) {
     let pushed = ctx.producer.push_slice(data);
 
     if pushed < buffer_size {
-        let consecutive = ctx.consecutive_drops.fetch_add(1, Ordering::AcqRel) + 1;
-
-        if consecutive > 10 {
-            ctx.should_terminate.store(true, Ordering::Release);
-            return;
-        }
-    } else {
-        ctx.consecutive_drops.store(0, Ordering::Release);
+        // The tap is system audio, not the mic. Drop on pressure instead of
+        // terminating the meeting; report outside the real-time callback.
+        ctx.dropped_samples.fetch_add((buffer_size - pushed) as u32, Ordering::Relaxed);
     }
 
     if pushed > 0 {
@@ -382,6 +405,13 @@ impl Stream for CoreAudioStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        if self.last_drop_log.elapsed() >= Duration::from_secs(5) {
+            let dropped = self._ctx.dropped_samples.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                warn!("CoreAudio system tap dropped {} samples under buffer pressure", dropped);
+            }
+            self.last_drop_log = Instant::now();
+        }
         // Try to pop a sample from the ring buffer
         if let Some(sample) = self.consumer.try_pop() {
             return Poll::Ready(Some(sample));
@@ -396,11 +426,18 @@ impl Stream for CoreAudioStream {
             };
         }
 
-        // No data available, register waker and return pending
+        // Register before checking again: the callback may have pushed data
+        // after our first pop but before it saw a registered waker.
         {
-            let mut state = self.waker_state.lock().unwrap();
+            // Clone the Arc so the guard does not borrow `self` while the
+            // consumer needs mutable access for the second pop.
+            let waker_state = self.waker_state.clone();
+            let mut state = waker_state.lock().unwrap();
             state.has_data = false;
             state.waker = Some(cx.waker().clone());
+            if let Some(sample) = self.consumer.try_pop() {
+                return Poll::Ready(Some(sample));
+            }
         }
 
         Poll::Pending

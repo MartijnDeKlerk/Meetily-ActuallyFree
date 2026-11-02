@@ -19,6 +19,8 @@ pub mod ffmpeg_mixer;  // NEW: FFmpeg-style adaptive audio mixer
 pub mod recording_state;
 pub mod pipeline;
 pub mod stream;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+pub mod capture_worker;
 pub mod recording_manager;
 pub mod recording_commands;
 pub mod recording_preferences;
@@ -28,6 +30,7 @@ pub mod level_monitor;
 pub mod simple_level_monitor;
 pub mod buffer_pool;
 pub mod post_processor;
+pub mod waveform;
 pub mod hardware_detector;
 pub mod async_logger;
 pub mod batch_processor;

@@ -29,6 +29,8 @@ pub struct RecordingManager {
     recording_saver: RecordingSaver,
     device_monitor: Option<AudioDeviceMonitor>,
     device_event_receiver: Option<mpsc::UnboundedReceiver<DeviceEvent>>,
+    per_app_enabled: bool,
+    per_app_targets: Vec<crate::audio::recording_preferences::PerAppTarget>,
 }
 
 // SAFETY: RecordingManager contains types that we've marked as Send
@@ -49,6 +51,8 @@ impl RecordingManager {
             recording_saver: RecordingSaver::new(),
             device_monitor: Some(device_monitor),
             device_event_receiver: Some(device_event_receiver),
+            per_app_enabled: false,
+            per_app_targets: Vec::new(),
         }
     }
 
@@ -86,7 +90,15 @@ impl RecordingManager {
             ("No Microphone".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
-        let (sys_name, sys_kind) = if let Some(ref sys) = system_device {
+        let (sys_name, sys_kind) = if self.per_app_enabled && !self.per_app_targets.is_empty() {
+            let names: Vec<String> = self.per_app_targets.iter().map(|t| t.name.clone()).collect();
+            let display = if names.len() == 1 {
+                names[0].clone()
+            } else {
+                format!("{} apps ({})", names.len(), names.join(", "))
+            };
+            (format!("App Audio ({})", display), super::device_detection::InputDeviceKind::Wired)
+        } else if let Some(ref sys) = system_device {
             let device_kind = super::device_detection::InputDeviceKind::detect(&sys.name, 512, 48000);
             (sys.name.clone(), device_kind)
         } else {
@@ -105,7 +117,7 @@ impl RecordingManager {
             || saver.start_accumulation(auto_save),
             mic_name,
             mic_kind,
-            sys_name,
+            sys_name.clone(),
             sys_kind,
             level_sender, // Live per-source level meter for the frontend visualizer
         ) {
@@ -115,7 +127,7 @@ impl RecordingManager {
         }
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
-            system_device.as_ref().map(|d| d.name.clone())
+            Some(sys_name)
         );
 
         // Give the pipeline a moment to fully initialize before starting streams
@@ -123,11 +135,17 @@ impl RecordingManager {
 
         // Start audio streams - they send RAW unmixed chunks to pipeline for mixing
         // Pipeline handles mixing and distribution to both recording and transcription
-        self.stream_manager.start_streams(microphone_device.clone(), system_device.clone(), None).await?;
+        let per_app_opt = if self.per_app_enabled && !self.per_app_targets.is_empty() {
+            Some(self.per_app_targets.clone())
+        } else {
+            None
+        };
+        self.stream_manager.start_streams_with_per_app(microphone_device.clone(), system_device.clone(), per_app_opt, None).await?;
 
-        // Start device monitoring to detect disconnects
+        // Start device monitoring to detect disconnects (skip system device monitoring if per-app)
         if let Some(ref mut monitor) = self.device_monitor {
-            if let Err(e) = monitor.start_monitoring(microphone_device, system_device) {
+            let monitor_sys = if self.per_app_enabled { None } else { system_device.clone() };
+            if let Err(e) = monitor.start_monitoring(microphone_device, monitor_sys) {
                 warn!("Failed to start device monitoring: {}", e);
                 // Non-fatal - continue without monitoring
             } else {
@@ -234,13 +252,11 @@ impl RecordingManager {
             monitor.stop_monitoring().await;
         }
 
-        // Stop recording state first
-        self.state.stop_recording();
-
-        // Stop audio streams
+        // Drain the microphone worker while the pipeline still accepts chunks.
         if let Err(e) = self.stream_manager.stop_streams().await {
             error!("Error stopping audio streams: {}", e);
         }
+        self.state.stop_recording();
 
         // Stop audio pipeline
         if let Err(e) = self.pipeline_manager.stop().await {
@@ -263,14 +279,12 @@ impl RecordingManager {
             monitor.stop_monitoring().await;
         }
 
-        // Stop recording state first - this clears device references
-        self.state.stop_recording();
-
-        // Stop audio streams immediately
+        // Drain accepted microphone blocks before disabling pipeline input.
         if let Err(e) = self.stream_manager.stop_streams().await {
             error!("Error stopping audio streams: {}", e);
             errors.push(format!("Failed to stop audio streams: {}", e));
         }
+        self.state.stop_recording();
 
         // CRITICAL: Force pipeline to flush ALL accumulated audio before stopping
         debug!("💨 Forcing pipeline to flush accumulated audio immediately");
@@ -325,13 +339,11 @@ impl RecordingManager {
         let recording_duration = self.state.get_active_recording_duration();
         info!("Recording duration before stop: {:?}s", recording_duration);
 
-        // Stop recording state first
-        self.state.stop_recording();
-
-        // Stop audio streams
+        // Drain the microphone worker before disabling pipeline input.
         if let Err(e) = self.stream_manager.stop_streams().await {
             error!("Error stopping audio streams: {}", e);
         }
+        self.state.stop_recording();
 
         // Stop audio pipeline
         if let Err(e) = self.pipeline_manager.stop().await {
@@ -431,6 +443,14 @@ impl RecordingManager {
         self.state.set_error_callback(callback);
     }
 
+    /// Set callback for warnings that leave recording running
+    pub fn set_warning_callback<F>(&self, callback: F)
+    where
+        F: Fn(&super::recording_state::AudioError) + Send + Sync + 'static,
+    {
+        self.state.set_warning_callback(callback);
+    }
+
     /// Check if there's a fatal error
     pub fn has_fatal_error(&self) -> bool {
         self.state.has_fatal_error()
@@ -439,6 +459,16 @@ impl RecordingManager {
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.recording_saver.set_meeting_name(name);
+    }
+
+    /// Configure per-application audio recording
+    pub fn set_per_app_config(
+        &mut self,
+        enabled: bool,
+        targets: Vec<crate::audio::recording_preferences::PerAppTarget>,
+    ) {
+        self.per_app_enabled = enabled;
+        self.per_app_targets = targets;
     }
 
     pub fn set_recordings_folder(&mut self, path: std::path::PathBuf) {

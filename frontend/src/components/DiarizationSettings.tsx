@@ -1,5 +1,6 @@
 "use client"
 
+import { Spinner } from '@/components/ui/spinner';
 import { useCallback, useEffect, useRef, useState } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import { listen, UnlistenFn } from "@tauri-apps/api/event"
@@ -10,7 +11,6 @@ import {
   AlertCircle,
   FolderOpen,
   Download,
-  Loader2,
   Cpu,
   Sliders,
   ExternalLink,
@@ -18,6 +18,7 @@ import {
 } from "lucide-react"
 import { Button } from "./ui/button"
 import { OPTIONAL_MODEL_PREFERENCES_CHANGED } from '@/lib/optional-model-activation';
+import { useOptionalModelDownloads } from '@/contexts/OptionalModelDownloadsContext';
 
 interface DownloadProgress {
   file: string;
@@ -55,7 +56,11 @@ function formatMB(bytes: number): string {
  */
 export function DiarizationSettings() {
   const [status, setStatus] = useState<DiarizationEngineStatus | null>(null);
-  const [isDownloading, setIsDownloading] = useState(false);
+  const [isPyannoteDownloading, setIsDownloading] = useState(false);
+  const { jobs, startDownload } = useOptionalModelDownloads();
+  const nemotronJob = jobs.nemotron;
+  const isNemotronDownloading = nemotronJob.status === 'downloading' || nemotronJob.status === 'activating';
+  const isDownloading = isPyannoteDownloading || isNemotronDownloading || nemotronJob.status === 'uninstalling';
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [isSwitching, setIsSwitching] = useState(false);
   const unlistenRef = useRef<UnlistenFn | null>(null);
@@ -69,6 +74,10 @@ export function DiarizationSettings() {
         console.error('Failed to get diarization status:', e);
       });
   }, []);
+
+  useEffect(() => {
+    if (nemotronJob.status === 'ready' || nemotronJob.status === 'idle' || nemotronJob.status === 'activation-error') refreshStatus();
+  }, [nemotronJob.status, refreshStatus]);
 
   useEffect(() => {
     refreshStatus();
@@ -130,9 +139,15 @@ export function DiarizationSettings() {
 
   const handleDownload = useCallback(async (targetEngine?: string) => {
     if (isDownloading) return;
+    const eng = targetEngine || status?.active_engine || 'pyannote';
+    // Settings and onboarding share the same app-owned Nemotron job. Leaving
+    // this page must not discard progress or create a second transfer owner.
+    if (eng === 'nemotron') {
+      startDownload('nemotron');
+      return;
+    }
     setIsDownloading(true);
     setProgress(null);
-    const eng = targetEngine || status?.active_engine || 'pyannote';
     let downloaded = false;
 
     try {
@@ -163,7 +178,7 @@ export function DiarizationSettings() {
       setIsDownloading(false);
       setProgress(null);
     }
-  }, [isDownloading, status, refreshStatus]);
+  }, [isDownloading, status, refreshStatus, startDownload]);
 
   const handleOpenFolder = async () => {
     try {
@@ -186,15 +201,15 @@ export function DiarizationSettings() {
     : status?.nemotron_download_size ?? 0;
 
   return (
-    <div className="rounded-xl border border-[var(--af-border)] bg-[var(--af-panel)] p-5 text-[var(--af-text)] shadow-sm sm:p-6 transition-colors">
+    <div className="rounded-2xl border border-af-border bg-af-panel-2/40 p-5 text-af-text">
       {/* Title & Top Status Badge */}
-      <div className="flex items-start justify-between gap-4 mb-4">
-        <div>
-          <h3 className="text-lg font-semibold text-[var(--af-text)] mb-2 flex items-center gap-2">
-            <Users className="w-5 h-5 text-blue-500" />
+      <div className="flex flex-wrap items-start justify-between gap-4 mb-4">
+        <div className="min-w-0 flex-1 basis-64">
+          <h3 className="text-[15px] font-semibold text-af-text mb-2 flex items-center gap-2">
+            <Users className="w-5 h-5 text-af-accent" />
             Speaker Identification
           </h3>
-          <p className="text-sm text-[var(--af-text-2)] leading-relaxed">
+          <p className="text-sm text-af-text-2">
             Labels your transcript with <strong>Speaker 1/2/3…</strong> by analyzing voices in the
             recording. Runs entirely on-device. Open a meeting and click{' '}
             <strong>Speakers</strong> above the transcript to run it.
@@ -202,10 +217,8 @@ export function DiarizationSettings() {
         </div>
         {status !== null && (
           <span
-            className={`flex items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-medium border transition-colors ${
-              currentAvailable
-                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                : 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+            className={`flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-medium ${
+              currentAvailable ? 'bg-af-success/10 text-af-success' : 'bg-af-warning/10 text-af-warning'
             }`}
           >
             {currentAvailable ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
@@ -216,66 +229,66 @@ export function DiarizationSettings() {
 
       {/* Engine Selection: Pyannote vs Nemotron-3 */}
       <div className="mt-4 mb-5">
-        <label className="text-xs font-bold text-slate-700 dark:text-slate-300 mb-2.5 block uppercase tracking-wider">
+        <label className="text-[11px] font-semibold text-af-text-3 mb-2.5 block uppercase tracking-wider">
           Diarization Engine
         </label>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,16rem),1fr))] gap-3">
           {/* Pyannote card */}
           <button
             type="button"
             onClick={() => handleSelectEngine('pyannote')}
             disabled={isSwitching || isDownloading}
-            className={`group p-4 rounded-xl text-left transition-all cursor-pointer relative ${
+            className={`group flex min-w-0 flex-col items-stretch p-4 rounded-xl text-left cursor-pointer relative disabled:cursor-default ${
               isPyannote
                 ? 'af-select-card-active-blue'
                 : 'af-select-card'
             }`}
           >
-            <div className="flex items-center justify-between mb-2.5">
-              <div className="flex items-center gap-2.5">
-                <span className={`p-2 rounded-lg transition-colors ${
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+              <div className="flex min-w-0 flex-1 basis-44 items-center gap-2.5">
+                <span className={`shrink-0 p-2 rounded-lg transition-colors ${
                   isPyannote
-                    ? 'bg-blue-600 text-white shadow-md shadow-blue-500/30'
-                    : 'bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 group-hover:bg-blue-100 dark:group-hover:bg-blue-900/40 group-hover:text-blue-600 dark:group-hover:text-blue-400'
+                    ? 'bg-af-accent text-af-on-accent'
+                    : 'bg-af-active text-af-text-2 group-hover:text-af-text'
                 }`}>
                   <Users className="w-4 h-4" />
                 </span>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-slate-900 dark:text-white text-base">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-af-text">
                       Pyannote
                     </span>
                     {status?.pyannote_available && (
-                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
+                      <span className="rounded-full bg-af-success/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-success">
                         Ready
                       </span>
                     )}
                   </div>
-                  <span className="text-[11px] text-blue-600 dark:text-blue-400 font-medium">
+                  <span className="text-[11px] text-af-text-3 font-medium">
                     Clustering Diarization
                   </span>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="ml-auto flex shrink-0 items-center gap-2 whitespace-nowrap">
                 {isPyannote ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2.5 py-1 rounded-full bg-blue-600 text-white shadow-sm ring-2 ring-blue-400/30">
-                    <Check className="w-3.5 h-3.5 stroke-[3]" /> Active
+                  <span className="inline-flex items-center gap-1 rounded-full border border-af-accent/40 bg-af-accent/10 px-2.5 py-1 text-[11px] font-medium text-af-accent">
+                    <Check className="w-3.5 h-3.5" /> Active
                   </span>
                 ) : (
-                  <span className="inline-flex items-center text-[11px] font-medium px-2.5 py-1 rounded-full border border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-300 group-hover:border-blue-400 group-hover:text-blue-600 dark:group-hover:border-blue-400 dark:group-hover:text-blue-300 transition-colors">
+                  <span className="inline-flex items-center rounded-full border border-af-border-strong px-2.5 py-1 text-[11px] font-medium text-af-text-2 transition-colors group-hover:text-af-text">
                     Select
                   </span>
                 )}
               </div>
             </div>
-            <p className="text-xs text-slate-600 dark:text-slate-200 leading-relaxed font-normal mt-1">
+            <p className="text-xs text-af-text-2 leading-relaxed mt-1">
               Bundled segmentation-3.0 with WeSpeaker ResNet34 embeddings & agglomerative clustering.
             </p>
-            <div className="mt-3.5 pt-2.5 border-t border-slate-200/90 dark:border-slate-700 flex items-center justify-between text-[11px]">
-              <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 font-medium">
+            <div className="mt-3.5 pt-2.5 border-t border-af-border flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <span className="px-2 py-0.5 rounded bg-af-panel text-af-text-3 border border-af-border font-medium">
                 Bundled with app
               </span>
-              <span className="font-semibold text-blue-600 dark:text-blue-400 px-2 py-0.5 rounded bg-blue-500/10 dark:bg-blue-500/20 border border-blue-500/30">
+              <span className="font-medium text-af-accent px-2 py-0.5 rounded bg-af-accent/10">
                   Local CPU
               </span>
             </div>
@@ -286,60 +299,78 @@ export function DiarizationSettings() {
             type="button"
             onClick={() => handleSelectEngine('nemotron')}
             disabled={isSwitching || isDownloading}
-            className={`group p-4 rounded-xl text-left transition-all cursor-pointer relative ${
+            className={`group flex min-w-0 flex-col items-stretch p-4 rounded-xl text-left cursor-pointer relative disabled:cursor-default ${
               isNemotron
                 ? 'af-select-card-active-purple'
                 : 'af-select-card'
             }`}
           >
-            <div className="flex items-center justify-between mb-2.5">
-              <div className="flex items-center gap-2.5">
-                <span className={`p-2 rounded-lg transition-colors ${
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+              <div className="flex min-w-0 flex-1 basis-44 items-center gap-2.5">
+                <span className={`shrink-0 p-2 rounded-lg transition-colors ${
                   isNemotron
-                    ? 'bg-purple-600 text-white shadow-md shadow-purple-500/30'
-                    : 'bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 group-hover:bg-purple-100 dark:group-hover:bg-purple-900/40 group-hover:text-purple-600 dark:group-hover:text-purple-400'
+                    ? 'bg-af-accent text-af-on-accent'
+                    : 'bg-af-active text-af-text-2 group-hover:text-af-text'
                 }`}>
                   <Cpu className="w-4 h-4" />
                 </span>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-slate-900 dark:text-white text-base">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-semibold text-af-text">
                       NVIDIA Nemotron-3
                     </span>
-                    {status?.nemotron_available && (
-                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border border-emerald-500/40 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
+                    {status?.nemotron_available && !isNemotronDownloading && (
+                      <span className="rounded-full bg-af-success/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-af-success">
                         Ready
                       </span>
                     )}
                   </div>
-                  <span className="text-[11px] text-purple-600 dark:text-purple-400 font-medium">
+                  <span className="text-[11px] text-af-text-3 font-medium">
                     Sortformer v3 Neural
                   </span>
                 </div>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="ml-auto flex shrink-0 items-center gap-2 whitespace-nowrap">
                 {isNemotron ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2.5 py-1 rounded-full bg-purple-600 text-white shadow-sm ring-2 ring-purple-400/30">
-                    <Check className="w-3.5 h-3.5 stroke-[3]" /> Active
+                  <span className="inline-flex items-center gap-1 rounded-full border border-af-accent/40 bg-af-accent/10 px-2.5 py-1 text-[11px] font-medium text-af-accent">
+                    <Check className="w-3.5 h-3.5" /> Active
                   </span>
                 ) : (
-                  <span className="inline-flex items-center text-[11px] font-medium px-2.5 py-1 rounded-full border border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-300 group-hover:border-purple-400 group-hover:text-purple-600 dark:group-hover:border-purple-400 dark:group-hover:text-purple-300 transition-colors">
+                  <span className="inline-flex items-center rounded-full border border-af-border-strong px-2.5 py-1 text-[11px] font-medium text-af-text-2 transition-colors group-hover:text-af-text">
                     Select
                   </span>
                 )}
               </div>
             </div>
-            <p className="text-xs text-slate-600 dark:text-slate-200 leading-relaxed font-normal mt-1">
+            <p className="text-xs text-af-text-2 leading-relaxed mt-1">
                 Post-call speaker detection with overlapping speech support. Windows uses DirectML GPU acceleration when available, with CPU fallback.
             </p>
-            <div className="mt-3.5 pt-2.5 border-t border-slate-200/90 dark:border-slate-700 flex items-center justify-between text-[11px]">
-              <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 font-medium">
+            <div className="mt-3.5 pt-2.5 border-t border-af-border flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <span className="px-2 py-0.5 rounded bg-af-panel text-af-text-3 border border-af-border font-medium">
                 Sortformer v3
               </span>
-              <span className="font-semibold text-purple-600 dark:text-purple-400 px-2 py-0.5 rounded bg-purple-500/10 dark:bg-purple-500/20 border border-purple-500/30">
+              <span className="font-medium text-af-accent px-2 py-0.5 rounded bg-af-accent/10">
                 Overlap detection
               </span>
             </div>
+            {isNemotronDownloading && (
+              <div className="mt-4 border-t border-af-border pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-af-text">
+                  <span>{nemotronJob.status === 'activating' ? 'Enabling model…' : nemotronJob.detail ?? 'Downloading…'}</span>
+                  <span className="tabular-nums">{Math.round(nemotronJob.progress)}%</span>
+                </div>
+                {nemotronJob.file && <p className="mt-1 break-all text-[11px] text-af-text-3">{nemotronJob.file}</p>}
+                {nemotronJob.totalBytes !== undefined && nemotronJob.totalBytes > 0 && nemotronJob.downloadedBytes !== undefined && (
+                  <p className="mt-1 text-[11px] text-af-text-3">
+                    Current file: {(nemotronJob.downloadedBytes / 1024 / 1024).toFixed(1)} / {(nemotronJob.totalBytes / 1024 / 1024).toFixed(1)} MiB
+                  </p>
+                )}
+                <div role="progressbar" aria-label="Nemotron download progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={nemotronJob.progress} className="mt-2 h-1.5 overflow-hidden rounded-full bg-af-hover">
+                  <div className="h-full rounded-full bg-af-accent transition-[width] duration-150" style={{ width: `${nemotronJob.progress}%` }} />
+                </div>
+              </div>
+            )}
+            {nemotronJob.error && <p className="mt-3 break-words text-xs text-af-danger">{nemotronJob.error}</p>}
           </button>
         </div>
       </div>
@@ -348,20 +379,20 @@ export function DiarizationSettings() {
       {isPyannote && (
         <>
           {status?.pyannote_available === true && (
-            <p className="mt-2 text-sm text-[var(--af-text-2)]">
+            <p className="mt-2 text-sm text-af-text-3">
               Models ship with the app — nothing to download.
             </p>
           )}
 
           {/* Missing Pyannote models */}
           {status?.pyannote_available === false && !isDownloading && (
-            <div className="mt-4 rounded-xl bg-amber-500/10 border border-amber-500/30 p-4">
-              <p className="text-sm text-amber-800 dark:text-amber-200 mb-3 leading-relaxed">
+            <div className="mt-4 rounded-xl bg-af-warning/10 p-4">
+              <p className="text-sm text-af-text mb-3 leading-relaxed">
                 The bundled speaker models couldn&apos;t be found. You can re-download them
                 {downloadBytes > 0 && <> (~{formatMB(downloadBytes)})</>} from this app&apos;s GitHub
                 release — files are verified with SHA-256.
               </p>
-              <Button size="sm" onClick={() => handleDownload('pyannote')} className="bg-blue-600 text-white hover:bg-blue-700">
+              <Button size="sm" onClick={() => handleDownload('pyannote')} className="bg-af-accent text-af-on-accent hover:bg-af-accent-hover">
                 <Download size={16} className="mr-1.5" />
                 Re-download models
               </Button>
@@ -373,20 +404,20 @@ export function DiarizationSettings() {
       {isNemotron && (
         <div className="space-y-4">
           {status?.nemotron_available === true && (
-            <div className="text-sm text-[var(--af-text-2)] flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+            <div className="text-sm text-af-text-2 flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-af-success" />
               <span>Nemotron-3 Sortformer model ready on-device.</span>
             </div>
           )}
 
           {/* Missing Nemotron models */}
           {status?.nemotron_available === false && !isDownloading && (
-            <div className="mt-4 rounded-xl bg-amber-500/10 border border-amber-500/30 p-4">
-              <p className="text-sm text-amber-800 dark:text-amber-200 mb-3 leading-relaxed">
+            <div className="mt-4 rounded-xl bg-af-warning/10 p-4">
+              <p className="text-sm text-af-text mb-3 leading-relaxed">
                 The Nemotron-3 Diarization model (~{formatMB(downloadBytes)}) runs fully on-device.
                 Download once to install the SHA-256 verified model and its license.
               </p>
-              <Button size="sm" onClick={() => handleDownload('nemotron')} className="bg-purple-600 text-white hover:bg-purple-700">
+              <Button size="sm" onClick={() => handleDownload('nemotron')} className="h-auto min-h-9 whitespace-normal bg-af-accent text-af-on-accent hover:bg-af-accent-hover">
                 <Download size={16} className="mr-1.5" />
                 Download Nemotron-3 models (~{formatMB(downloadBytes)})
               </Button>
@@ -394,27 +425,27 @@ export function DiarizationSettings() {
           )}
 
           {/* Nemotron Fine-tuning / Configuration */}
-          <div className="mt-3.5 p-4 sm:p-5 border border-purple-400/40 dark:border-purple-500/40 rounded-xl bg-purple-50/40 dark:bg-purple-950/25 space-y-4 transition-colors">
-            <div className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2 uppercase tracking-wide">
-              <Sliders className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+          <div className="mt-3.5 p-4 border border-af-border rounded-xl bg-af-panel-2 space-y-4">
+            <div className="text-[11px] font-semibold text-af-text-3 flex items-center gap-2 uppercase tracking-wider">
+              <Sliders className="w-4 h-4 text-af-accent" />
               Nemotron-3 Detection Settings
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">Speaker channels</span>
-                  <span className="text-xs font-mono font-bold px-2.5 py-0.5 rounded-md border border-purple-300 dark:border-purple-600/80 bg-white dark:bg-slate-900 text-purple-700 dark:text-purple-300 shadow-xs">
+                  <span className="text-xs font-medium text-af-text-2">Speaker channels</span>
+                  <span className="text-xs font-mono font-medium px-2 py-0.5 rounded-md bg-af-active text-af-text tabular-nums">
                     8
                   </span>
                 </div>
-                <span className="text-[11px] text-slate-500 dark:text-slate-400 block mt-1">
+                <span className="text-[11px] text-af-text-3 block mt-1">
                   Nemotron tracks up to 8 remote speakers live and refines labels after recording. Microphone audio remains labeled You. Live engine changes apply to the next recording.
                 </span>
               </div>
               <div>
                 <div className="flex items-center justify-between mb-1.5">
-                  <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">Speech Threshold</span>
-                  <span className="text-xs font-mono font-bold px-2.5 py-0.5 rounded-md border border-purple-300 dark:border-purple-600/80 bg-white dark:bg-slate-900 text-purple-700 dark:text-purple-300 shadow-xs">
+                  <span className="text-xs font-medium text-af-text-2">Speech Threshold</span>
+                  <span className="text-xs font-mono font-medium px-2 py-0.5 rounded-md bg-af-active text-af-text tabular-nums">
                     {(status?.nemotron_threshold ?? 0.50).toFixed(2)}
                   </span>
                 </div>
@@ -425,9 +456,10 @@ export function DiarizationSettings() {
                   step={0.05}
                   value={status?.nemotron_threshold ?? 0.50}
                   onChange={(e) => handleUpdateConfig({ nemotronThreshold: parseFloat(e.target.value) })}
-                  className="w-full accent-purple-600 dark:accent-purple-400 cursor-pointer"
+                  className="af-volume"
+                  style={{ '--fill': `${(((status?.nemotron_threshold ?? 0.50) - 0.10) / 0.80) * 100}%` } as React.CSSProperties}
                 />
-                <span className="text-[11px] text-slate-500 dark:text-slate-400 block mt-1">
+                <span className="text-[11px] text-af-text-3 block mt-1">
                   Sensitivity for active speech frames (default: 0.50).
                 </span>
               </div>
@@ -437,10 +469,10 @@ export function DiarizationSettings() {
       )}
 
       {/* Live Download Progress */}
-      {isDownloading && (
-        <div className="mt-4 rounded-xl border border-blue-500/30 bg-blue-500/10 dark:bg-blue-950/30 p-4 text-[var(--af-text)]">
-          <div className="flex items-center gap-2 text-sm font-medium text-slate-900 dark:text-white">
-            <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+      {isPyannoteDownloading && (
+        <div className="mt-4 rounded-xl border border-af-accent/40 bg-af-accent/10 p-4">
+          <div className="flex items-center gap-2 text-sm font-medium text-af-accent">
+            <Spinner className="w-4 h-4" />
             {progress?.status === 'verifying'
               ? `Verifying ${progress.file}…`
               : progress?.file
@@ -448,45 +480,45 @@ export function DiarizationSettings() {
                 : 'Starting download…'}
           </div>
 
-          <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800 border border-slate-300 dark:border-slate-700">
+          <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-af-accent/10">
             <div
-              className="h-full bg-blue-600 transition-[width] duration-150"
+              className="h-full bg-af-accent transition-[width] duration-150"
               style={{ width: `${Math.max(2, progress?.percent ?? 0)}%` }}
             />
           </div>
 
-          <div className="mt-1.5 flex justify-between text-xs text-slate-600 dark:text-slate-300">
+          <div className="mt-1.5 flex justify-between text-xs text-af-accent">
             <span>
               {progress && progress.total > 0
                 ? `${formatMB(progress.downloaded)} / ${formatMB(progress.total)}`
                 : ''}
             </span>
-            <span className="font-semibold text-blue-600 dark:text-blue-400">{(progress?.percent ?? 0).toFixed(0)}%</span>
+            <span className="font-semibold tabular-nums">{(progress?.percent ?? 0).toFixed(0)}%</span>
           </div>
         </div>
       )}
 
       {/* Model folder info */}
       {status?.model_dir && (
-        <div className="mt-4 p-4 border border-slate-200 dark:border-slate-700 rounded-xl bg-slate-50/70 dark:bg-slate-900/60 text-[var(--af-text)] transition-colors">
+        <div className="mt-4 p-3 border border-af-border rounded-xl bg-af-panel-2">
           <div className="flex items-center justify-between mb-1.5">
-            <div className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-              <FolderOpen className="w-4 h-4 text-blue-500" />
+            <div className="text-xs font-medium text-af-text-2 flex items-center gap-1.5">
+              <FolderOpen className="w-3.5 h-3.5" />
               Model Directory
             </div>
             <button
               type="button"
               onClick={handleOpenFolder}
-              className="text-xs text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 font-semibold cursor-pointer"
+              className="text-xs text-af-accent hover:text-af-accent-hover flex items-center gap-1 font-medium cursor-pointer transition-colors"
             >
               <ExternalLink className="w-3.5 h-3.5" />
               Open in Explorer
             </button>
           </div>
-          <div className="text-xs text-slate-700 dark:text-slate-200 break-all font-mono p-2.5 rounded-lg bg-white dark:bg-[#0c1017] border border-slate-200 dark:border-slate-800 shadow-xs">
+          <div className="text-xs text-af-text-2 break-all font-mono p-2 rounded-lg bg-af-panel border border-af-border">
             {status.model_dir}
           </div>
-          <div className="mt-2 text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+          <div className="mt-2 text-xs text-af-text-3 leading-relaxed">
             {isPyannote ? (
               <>
                 Drop your own <code>segmentation-3.0-fp16.onnx</code>,{' '}
@@ -504,7 +536,7 @@ export function DiarizationSettings() {
       )}
 
       {/* Attribution footer */}
-      <p className="mt-4 text-xs text-[var(--af-text-3)] leading-relaxed">
+      <p className="mt-4 text-xs text-af-text-4 leading-relaxed">
         {isPyannote ? (
           <>
             Models: pyannote <code>segmentation-3.0</code> (MIT) · WeSpeaker ResNet34 (Apache-2.0) · VBx

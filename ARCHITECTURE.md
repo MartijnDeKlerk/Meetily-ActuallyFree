@@ -266,7 +266,29 @@ report-upload server; nothing is uploaded automatically.
 The in-app ZIP is deliberately allowlist-only: crash classification/time,
 version/backend, OS family and major version, architecture, bucketed CPU core
 count, rounded memory size, source-relative panic file/line details, and a
-panic-location fingerprint. It
+panic-location fingerprint. Schema 2 also includes a bounded, content-free
+lifecycle timeline and active operations recovered from the failed native session.
+`diagnostics.rs` owns the typed stage/outcome allowlist, 128-event queue/ring,
+32-active-operation cap, relative millisecond timings, and dropped/evicted counts.
+A dedicated thread atomically persists snapshots; producers never wait for queue
+capacity or do disk I/O. Active stages get a one-second elapsed-time heartbeat and
+one `slow` marker after 15 seconds (not proof of a deadlock). An unfinished span
+is `interrupted` on unwinding/cancellation; an abruptly killed process leaves it
+active in the last persisted snapshot. Completed/failed outcomes reflect Results.
+Native runtime checks, Parakeet/Whisper init/load, STT memory preparation, both
+recording start paths, lifecycle-lock waits, device/model checks, live diarization,
+capture startup/shutdown, final transcription drain and audio save are instrumented.
+Snapshots are session-keyed, folded into pending.json before a new session starts,
+and old journals are pruned. Export uses that frozen report, never the next session.
+Legacy schema-1 pending reports remain readable. No frontend IPC payload, raw error,
+model filename or device label is accepted by the journal.
+
+Coverage: native tests exercise bounded retention/overflow, slow and unfinished
+operations, session isolation, stale-session ZIP recovery, schema-1 compatibility,
+and rejection of unknown stage strings. Persistence is best effort: abrupt exit
+can lose queued events, disk/thread failures can leave no journal, and frontend-only
+hangs or uninstrumented work remain outside this timeline. These diagnostics do
+not establish the cause of #67 or fix its reported freeze. The ZIP still
 never includes ordinary logs, recordings, checkpoints, transcript/summary data,
 meeting identity, SQLite/WebView/settings storage, credentials, usernames,
 hostnames, or device names. Do not replace it with the much broader manual
@@ -419,7 +441,8 @@ exactly this confusion; it has been deleted along with `SettingTabs.tsx`,
 The label also has to survive the Rust side: `MeetingTranscript` must include
 `speaker`, and every place constructing it must set it.
 
-`InsightTabs` renders the complete stored Markdown as its authoritative summary.
+`components/meeting/MeetingDocument.tsx` renders the complete stored Markdown
+(`completeSummaryMarkdown` in `lib/summary-markdown.ts`) as its authoritative summary.
 English-keyword action/topic shortcuts are supplemental only; never make them the
 sole visible representation, because custom and non-English headings do not map
 reliably to those buckets. Preserve Markdown whitespace, nesting, and table syntax.
@@ -580,6 +603,23 @@ No dependency on any third party's hosting:
 | Parakeet v3 | This project's own GitHub release |
 | Qwen / Gemma | HuggingFace (`unsloth`, `bartowski`) |
 | Diarization | Bundled in the app (`resources/diarization/`) |
+
+### Claude Code CLI provider
+
+The `claude-cli` summary provider is the one provider that is neither an HTTP
+call nor a bundled model: it runs the user's own `claude` executable once per
+completion (`--print --output-format json`, prompt on stdin). `claude_cli/`
+owns discovery, the free `--version` / `auth status --json` probe, and the
+one-shot spawn; `llm_client::generate_summary` returns to it early, exactly as
+it does for `BuiltInAI`. The CLI is never bundled and no API key is stored —
+authentication belongs to the signed-in CLI, which is the point of the provider.
+
+Each run is stripped to a plain model call (`--tools ""`, `--strict-mcp-config`,
+`--setting-sources ""`, `--no-session-persistence`) inside an empty app-owned
+working directory. Do not relax this: with settings, hooks or MCP servers
+loaded, a summary can hit a permission prompt and hang, or absorb an unrelated
+project's `CLAUDE.md`. The prompt must stay on stdin — transcripts routinely
+exceed the Windows ~32k command-line limit.
 
 Parakeet v3 originally pointed at the upstream project's server; it was mirrored
 so this fork doesn't consume someone else's bandwidth.
