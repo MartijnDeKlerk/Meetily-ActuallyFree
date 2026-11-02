@@ -214,6 +214,34 @@ fi
 echo -e "${BLUE}Building complete Tauri application...${NC}"
 echo ""
 
+# The AppImage bundles GStreamer (bundleMediaFramework in tauri.linux.conf.json)
+# so WebKit can play meeting audio. linuxdeploy-plugin-gstreamer needs patchelf,
+# and it looks for gst-plugin-scanner/gst-ptp-helper only in the Debian layout
+# (/usr/lib/<arch>-linux-gnu/gstreamer1.0/gstreamer-1.0). Arch/Fedora keep them
+# next to the plugins, so hand it a directory holding just the helpers;
+# otherwise the AppRun hook points GST_PLUGIN_SCANNER at a missing file.
+if [ "$OS" = "linux" ]; then
+    if ! command -v patchelf >/dev/null 2>&1; then
+        echo -e "${RED}❌ patchelf is required to bundle GStreamer into the AppImage${NC}"
+        exit 1
+    fi
+    if [ -z "$GSTREAMER_HELPERS_DIR" ] && [ ! -d "/usr/lib/$(uname -m)-linux-gnu/gstreamer1.0/gstreamer-1.0" ]; then
+        for gst_lib in /usr/lib64 /usr/lib; do
+            if [ -x "$gst_lib/gstreamer-1.0/gst-plugin-scanner" ]; then
+                GSTREAMER_HELPERS_DIR="$(mktemp -d)"
+                trap 'rm -rf "$GSTREAMER_HELPERS_DIR"' EXIT
+                for helper in gst-plugin-scanner gst-ptp-helper; do
+                    if [ -e "$gst_lib/gstreamer-1.0/$helper" ]; then
+                        ln -s "$gst_lib/gstreamer-1.0/$helper" "$GSTREAMER_HELPERS_DIR/"
+                    fi
+                done
+                export GSTREAMER_HELPERS_DIR
+                break
+            fi
+        done
+    fi
+fi
+
 # NO_STRIP true due to issues with bundling appImage
 NO_STRIP=true $PKG_MGR run tauri:build
 
