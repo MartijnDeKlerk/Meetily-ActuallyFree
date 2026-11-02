@@ -152,6 +152,16 @@ Paths below are relative to `frontend/src-tauri/src/` unless marked frontend.
   recording. Changing settings during a call affects the next live session.
 - One transcript turn currently gets one greatest-overlap label. Do not split
   text or fabricate word timestamps to represent within-turn speaker changes.
+- `transcripts.source` (`mic`/`system`, NULL for imports and older rows)
+  records which track a turn was transcribed from. Live saves derive it from
+  the worker's source label (`You` ⇒ mic); retranscription sets it from the
+  source hint. The speaker label used to be the only provenance and
+  diarization overwrote it. With source tracks, offline diarization keeps mic
+  turns `You` and labels system turns only from system-track speakers
+  (`speakers_on_line` with the mic speaker excluded), so brief cross-talk at a
+  turn change no longer yields `You + Speaker N`. NULL-source turns keep the
+  cross-track overlap heuristic. Tests: `diarization::tests::system_lines_*`,
+  `genuine_remote_crosstalk_*`, `transcript::tests::live_label_maps_*`.
 
 ### Worker and shutdown ownership
 

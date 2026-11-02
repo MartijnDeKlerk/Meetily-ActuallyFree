@@ -244,6 +244,26 @@ fn is_manual_speaker_label(label: &str) -> bool {
     !is_generated
 }
 
+/// Capture track for a retranscription source hint: mic.mp4 is "You",
+/// system.mp4 is "Guest", and mixed-audio fallback has no single track.
+fn capture_source_for_hint(speaker_hint: Option<&str>) -> Option<&'static str> {
+    match speaker_hint {
+        Some(hint) if hint.eq_ignore_ascii_case("you") => Some("mic"),
+        Some(hint) if hint.eq_ignore_ascii_case("guest") => Some("system"),
+        _ => None,
+    }
+}
+
+/// `label` with any "You" part removed, or None if nothing else remains.
+fn without_local_user(label: &str) -> Option<String> {
+    let parts: Vec<&str> = label
+        .split(" + ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.eq_ignore_ascii_case("you"))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" + "))
+}
+
 fn create_source_labeled_segments(
     transcripts: &[(String, f64, f64)],
     speaker_hints: &[Option<&str>],
@@ -572,10 +592,13 @@ async fn run_retranscription<R: Runtime>(
     .await
     .unwrap_or_default();
 
+    // Names are only carried onto system-track lines, and the local user is
+    // never on the system track: drop a "You" part so an old combined label
+    // like "You + Alice" carries over as "Alice".
     let manual_ranges: Vec<(f64, f64, String)> = existing_transcripts
         .into_iter()
         .filter_map(|(s_opt, e_opt, spk_opt)| {
-            let spk = spk_opt?;
+            let spk = without_local_user(&spk_opt?)?;
             if is_manual_speaker_label(&spk) {
                 let s = s_opt?;
                 let e = e_opt?;
@@ -649,10 +672,12 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
-    for segment in &segments {
+    // `speaker_hints` is index-aligned with `segments`; the hint, not the
+    // (possibly name-carried) label, is the line's capture track.
+    for (segment, speaker_hint) in segments.iter().zip(&speaker_hints) {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -662,6 +687,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(segment.audio_end_time)
         .bind(segment.duration)
         .bind(&segment.speaker)
+        .bind(capture_source_for_hint(*speaker_hint))
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -1229,6 +1255,24 @@ mod tests {
         std::fs::write(dir.path().join("audio.mp4"), b"fake").unwrap();
         let found = find_audio_file(dir.path()).unwrap();
         assert_eq!(found.file_name().unwrap(), "audio.mp4");
+    }
+
+    #[test]
+    fn source_hints_map_to_capture_tracks() {
+        assert_eq!(capture_source_for_hint(Some("You")), Some("mic"));
+        assert_eq!(capture_source_for_hint(Some("Guest")), Some("system"));
+        assert_eq!(capture_source_for_hint(None), None);
+    }
+
+    #[test]
+    fn carried_names_never_include_the_local_user() {
+        assert_eq!(without_local_user("You + Alice").as_deref(), Some("Alice"));
+        assert_eq!(
+            without_local_user("Alice + Bob").as_deref(),
+            Some("Alice + Bob")
+        );
+        assert_eq!(without_local_user("Alice").as_deref(), Some("Alice"));
+        assert_eq!(without_local_user("You"), None);
     }
 
     #[test]

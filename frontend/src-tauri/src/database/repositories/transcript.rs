@@ -60,9 +60,10 @@ impl TranscriptsRepository {
                 // `speaker` must be persisted: the offline diarization pass
                 // finds the local user by matching the live "You" ranges, so
                 // omitting it here erased the user's identity from every
-                // meeting the moment it was saved.
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                // meeting the moment it was saved. `source` keeps that track
+                // provenance after diarization has rewritten `speaker`.
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, source)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&transcript_id)
             .bind(&meeting_id)
@@ -72,6 +73,7 @@ impl TranscriptsRepository {
             .bind(segment.audio_end_time)
             .bind(segment.duration)
             .bind(&segment.speaker)
+            .bind(capture_source_for_live_label(segment.speaker.as_deref()))
             .execute(&mut *transaction)
             .await;
 
@@ -278,6 +280,21 @@ pub(crate) fn is_default_meeting_title(title: &str) -> bool {
             && timestamp.as_bytes().get(10) == Some(&b'_'))
 }
 
+/// Capture track of a line as saved at the end of a live recording.
+///
+/// At that point the label is still the transcription worker's source tag:
+/// mic chunks are always exactly "You", and system chunks are "Guest",
+/// "Speaker N" or a matched contact name (never "You"). A line without a
+/// label has no known source.
+pub fn capture_source_for_live_label(label: Option<&str>) -> Option<&'static str> {
+    let label = label.map(str::trim).filter(|label| !label.is_empty())?;
+    Some(if label.eq_ignore_ascii_case("you") {
+        "mic"
+    } else {
+        "system"
+    })
+}
+
 fn matches_timestamp_shape(
     value: &str,
     expected_len: usize,
@@ -306,7 +323,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, folder_path TEXT, title_is_manual INTEGER); \
-             CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT); \
+             CREATE TABLE transcripts (id TEXT PRIMARY KEY, meeting_id TEXT, transcript TEXT, timestamp TEXT, audio_start_time REAL, audio_end_time REAL, duration REAL, speaker TEXT, source TEXT); \
              CREATE TABLE people (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, normalized_name TEXT NOT NULL UNIQUE, notes TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); \
              CREATE TABLE person_speakers (person_id TEXT NOT NULL, meeting_id TEXT NOT NULL, speaker_label TEXT NOT NULL, UNIQUE(meeting_id, speaker_label));"
         ).execute(&pool).await.unwrap();
@@ -320,6 +337,23 @@ mod tests {
         let linked: Vec<String> = sqlx::query_scalar("SELECT speaker_label FROM person_speakers WHERE meeting_id = ?")
             .bind(meeting).fetch_all(&pool).await.unwrap();
         assert_eq!(linked, vec!["Alice"]);
+    }
+
+    #[test]
+    fn live_label_maps_to_its_capture_track() {
+        assert_eq!(capture_source_for_live_label(Some("You")), Some("mic"));
+        assert_eq!(capture_source_for_live_label(Some(" you ")), Some("mic"));
+        assert_eq!(capture_source_for_live_label(Some("Guest")), Some("system"));
+        assert_eq!(
+            capture_source_for_live_label(Some("Speaker 2")),
+            Some("system")
+        );
+        assert_eq!(
+            capture_source_for_live_label(Some("Josh Sullivan")),
+            Some("system")
+        );
+        assert_eq!(capture_source_for_live_label(Some("  ")), None);
+        assert_eq!(capture_source_for_live_label(None), None);
     }
 
     #[test]

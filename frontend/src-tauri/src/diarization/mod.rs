@@ -1232,8 +1232,9 @@ pub async fn diarize_meeting(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = sqlx::query_as(
-        "SELECT id, audio_start_time, audio_end_time, speaker, transcript, timestamp FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC, id ASC",
+        "SELECT id, audio_start_time, audio_end_time, speaker, transcript, timestamp, source FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC, id ASC",
     )
     .bind(&meeting_id)
     .fetch_all(pool)
@@ -1243,12 +1244,12 @@ pub async fn diarize_meeting(
     // Work out which of the freshly-clustered speakers is the local user.
     let user_ranges: Vec<(f32, f32)> = rows
         .iter()
-        .filter(|(_, _, _, spk, _, _)| {
+        .filter(|(_, _, _, spk, _, _, _)| {
             spk.as_deref()
                 .map(|s| s.eq_ignore_ascii_case("you"))
                 .unwrap_or(false)
         })
-        .filter_map(|(_, s, e, _, _, _)| match (s, e) {
+        .filter_map(|(_, s, e, _, _, _, _)| match (s, e) {
             (Some(s), Some(e)) if e > s => Some((*s as f32, *e as f32)),
             _ => None,
         })
@@ -1292,7 +1293,12 @@ pub async fn diarize_meeting(
 
     let mut manual_speakers_ranges: std::collections::HashMap<String, Vec<(f32, f32)>> =
         std::collections::HashMap::new();
-    for (_, s_opt, e_opt, spk_opt, _, _) in &rows {
+    for (_, s_opt, e_opt, spk_opt, _, _, source) in &rows {
+        // Remote names describe system-track voices; a mic line's (possibly
+        // stale combined) label must not lend its range to a remote cluster.
+        if used_source_tracks && source.as_deref() == Some("mic") {
+            continue;
+        }
         if let (Some(s), Some(e), Some(spk)) = (s_opt, e_opt, spk_opt) {
             if *e > *s {
                 for name in extract_manual_speaker_names(spk) {
@@ -1374,7 +1380,20 @@ pub async fn diarize_meeting(
     let mut updates: Vec<(String, Option<String>)> = Vec::new();
     let mut preserved = 0u32;
 
-    for (id, start, end, existing, _, _) in rows {
+    for (id, start, end, existing, _, _, source) in rows {
+        // With separate mic and system tracks, each line was transcribed from
+        // exactly one of them, so its track decides who can be on it: mic
+        // lines are the local user, and system lines only hear the system
+        // track's speakers. Without this, any brief cross-talk at a turn
+        // change labelled a one-person line "You + Speaker N". Lines without a
+        // recorded track (older meetings, imports) keep the overlap heuristic.
+        let track = if used_source_tracks {
+            source.as_deref()
+        } else {
+            None
+        };
+        let system_line = track == Some("system");
+
         if let Some(ref live) = existing {
             let live_trim = live.trim();
             if !live_trim.is_empty() {
@@ -1383,13 +1402,21 @@ pub async fn diarize_meeting(
                         || part.eq_ignore_ascii_case("you")
                         || part.to_ascii_lowercase().starts_with("speaker ")
                 });
-                let is_named = !is_generated;
+                // Once the track is known, a combined label is earlier
+                // diarization output, not a name the user typed.
+                let is_named = !is_generated && !(track.is_some() && live_trim.contains(" + "));
                 if is_named {
                     preserved += 1;
                     assignments.push((id, live_trim.to_string()));
                     continue;
                 }
             }
+        }
+
+        if track == Some("mic") {
+            updates.push((id.clone(), Some("You".to_string())));
+            assignments.push((id, "You".to_string()));
+            continue;
         }
 
         let (s, e) = match (start, end) {
@@ -1400,59 +1427,32 @@ pub async fn diarize_meeting(
             }
         };
 
-        // Generated labels are not durable capture-source provenance. Preserve
-        // source hints without excluding genuine simultaneous speakers.
-        let relevant_segments: Vec<&DiarizationSegment> = result
-            .segments
-            .iter()
-            .filter(|seg| {
-                let ov = seg.end.min(e) - seg.start.max(s);
-                ov > 0.0
-            })
-            .collect();
-
         // Diarization updates labels only. Text length cannot establish word
         // alignment, and reruns must preserve every transcript byte and timing.
         {
-            let mut overlap_by_speaker: std::collections::HashMap<usize, f32> =
-                std::collections::HashMap::new();
-            for seg in &relevant_segments {
-                let ov = seg.end.min(e) - seg.start.max(s);
-                if ov > 0.0 {
-                    *overlap_by_speaker.entry(seg.speaker).or_insert(0.0) += ov;
-                }
-            }
-
-            if let Some((&primary, _)) = overlap_by_speaker
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                let cutoff = (overlap_by_speaker[&primary] * 0.20).max(0.08);
-                let mut speakers = vec![primary];
-                for (&other, &other_ov) in &overlap_by_speaker {
-                    if other != primary && other_ov >= cutoff {
-                        let has_simultaneous = relevant_segments.iter().any(|a| {
-                            a.speaker == primary
-                                && relevant_segments.iter().any(|b| {
-                                    b.speaker == other
-                                        && a.end.min(b.end).min(e) - a.start.max(b.start).max(s)
-                                            >= 0.08
-                                })
-                        });
-                        if has_simultaneous {
-                            speakers.push(other);
-                        }
-                    }
-                }
-
-                speakers.sort_unstable();
+            // System lines never hear the mic track's speaker.
+            let excluded = if system_line { user_speaker } else { None };
+            let speakers = speakers_on_line(&result.segments, s, e, excluded);
+            if !speakers.is_empty() {
                 let mut labels: Vec<_> = speakers.into_iter().map(&speaker_label).collect();
-                apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), &mut labels);
+                if !system_line {
+                    apply_source_track_hint(existing.as_deref(), used_source_tracks, num_speakers != Some(1), &mut labels);
+                }
                 labels.dedup();
                 labels.truncate(3);
                 let final_label = labels.join(" + ");
                 updates.push((id.clone(), Some(final_label.clone())));
                 assignments.push((id, final_label));
+            } else if system_line {
+                // No remote voice overlaps this system line: keep its label
+                // minus any local-user part, or else the generic remote label.
+                let label = existing
+                    .as_deref()
+                    .and_then(without_local_user)
+                    .unwrap_or_else(|| "Guest".to_string());
+                preserved += 1;
+                assignments.push((id.clone(), label.clone()));
+                updates.push((id, Some(label)));
             } else {
                 // No voice overlaps this line: keep the source hint, or else the
                 // label it already had, rather than clearing it.
@@ -1684,6 +1684,64 @@ fn collect_turns(models: &mut DiarizationModels, samples: &[f32]) -> Result<Vec<
     Ok(turns)
 }
 
+/// Speakers voiced on the line spanning `s..e` seconds, sorted by index.
+///
+/// The speaker with the most overlap is primary. Another speaker joins only
+/// with at least 20% of the primary's overlap (and 80 ms) and 80 ms of speech
+/// genuinely simultaneous with the primary's, so a line carries both names
+/// only when two people really spoke over each other inside it. `excluded`
+/// drops one speaker entirely (the mic track's, for system-track lines).
+fn speakers_on_line(
+    segments: &[DiarizationSegment],
+    s: f32,
+    e: f32,
+    excluded: Option<usize>,
+) -> Vec<usize> {
+    let relevant: Vec<&DiarizationSegment> = segments
+        .iter()
+        .filter(|seg| Some(seg.speaker) != excluded && seg.end.min(e) - seg.start.max(s) > 0.0)
+        .collect();
+    let mut overlap_by_speaker: std::collections::HashMap<usize, f32> =
+        std::collections::HashMap::new();
+    for seg in &relevant {
+        *overlap_by_speaker.entry(seg.speaker).or_insert(0.0) += seg.end.min(e) - seg.start.max(s);
+    }
+    let Some((&primary, &primary_ov)) = overlap_by_speaker
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        return Vec::new();
+    };
+    let cutoff = (primary_ov * 0.20).max(0.08);
+    let mut speakers = vec![primary];
+    for (&other, &other_ov) in &overlap_by_speaker {
+        if other != primary && other_ov >= cutoff {
+            let has_simultaneous = relevant.iter().any(|a| {
+                a.speaker == primary
+                    && relevant.iter().any(|b| {
+                        b.speaker == other
+                            && a.end.min(b.end).min(e) - a.start.max(b.start).max(s) >= 0.08
+                    })
+            });
+            if has_simultaneous {
+                speakers.push(other);
+            }
+        }
+    }
+    speakers.sort_unstable();
+    speakers
+}
+
+/// `label` with any "You" part removed, or None if nothing else remains.
+fn without_local_user(label: &str) -> Option<String> {
+    let parts: Vec<&str> = label
+        .split(" + ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.eq_ignore_ascii_case("you"))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" + "))
+}
+
 fn apply_source_track_hint(
     existing: Option<&str>,
     used_source_tracks: bool,
@@ -1717,6 +1775,52 @@ fn apply_source_track_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seg(start: f32, end: f32, speaker: usize) -> DiarizationSegment {
+        DiarizationSegment {
+            start,
+            end,
+            speaker,
+            overlapped: false,
+        }
+    }
+
+    #[test]
+    fn system_lines_ignore_mic_speech_at_a_turn_change() {
+        // A short remote reply ("Sure.", 10.0–11.5 s, speaker 1 on the system
+        // track) while the local user (speaker 0, mic track) resumes 0.4 s
+        // before it ends: 0.4 s clears the 20%-of-1.5 s cutoff.
+        let segments = [seg(10.0, 11.5, 1), seg(11.1, 20.0, 0)];
+        // Without track provenance the line picks up both voices...
+        assert_eq!(speakers_on_line(&segments, 10.0, 11.5, None), vec![0, 1]);
+        // ...but it was transcribed from the system track, so only one is on it.
+        assert_eq!(speakers_on_line(&segments, 10.0, 11.5, Some(0)), vec![1]);
+    }
+
+    #[test]
+    fn genuine_remote_crosstalk_still_names_both_remote_speakers() {
+        let segments = [seg(0.0, 4.0, 1), seg(1.0, 3.0, 2), seg(0.0, 4.0, 0)];
+        assert_eq!(speakers_on_line(&segments, 0.0, 4.0, Some(0)), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_line_with_only_excluded_speech_has_no_speakers() {
+        let segments = [seg(0.0, 4.0, 0)];
+        assert!(speakers_on_line(&segments, 0.0, 4.0, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn local_user_part_is_dropped_from_remote_labels() {
+        assert_eq!(
+            without_local_user("You + Josh Sullivan").as_deref(),
+            Some("Josh Sullivan")
+        );
+        assert_eq!(
+            without_local_user("Speaker 1").as_deref(),
+            Some("Speaker 1")
+        );
+        assert_eq!(without_local_user("You"), None);
+    }
 
     #[tokio::test]
     async fn label_reruns_preserve_text_timing_and_rollback_as_a_unit() {
