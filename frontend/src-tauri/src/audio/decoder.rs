@@ -454,7 +454,7 @@ pub fn decode_audio_file_with_progress(
     let track_id = track.id;
 
     // Get audio parameters
-    let sample_rate = track
+    let mut sample_rate = track
         .codec_params
         .sample_rate
         .ok_or_else(|| anyhow!("Unknown sample rate"))?;
@@ -515,6 +515,12 @@ pub fn decode_audio_file_with_progress(
                 if sample_buf.is_none() {
                     let spec = *decoded.spec();
                     let duration = decoded.capacity() as u64;
+                    // HE-AAC's container rate can differ from the decoded AAC-LC
+                    // core (upstream #608). All timing/resampling uses decoded Hz.
+                    if spec.rate != sample_rate {
+                        info!("Sample rate corrected: metadata={} decoded={}", sample_rate, spec.rate);
+                        sample_rate = spec.rate;
+                    }
                     // Detect actual channel count from decoded audio (metadata may be wrong/missing)
                     let actual_channels = spec.channels.count() as u16;
                     if actual_channels != channels {
@@ -580,6 +586,16 @@ pub fn decode_audio_file_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_he_aac_uses_decoded_rate_and_preserves_duration() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/he_aac_48k_5s.m4a");
+        let decoded = decode_audio_file(&path).expect("HE-AAC fixture");
+        assert_eq!(decoded.sample_rate, 24000);
+        assert!((decoded.duration_seconds - 5.16).abs() < 0.5);
+        assert!((decoded.to_whisper_format().len() as f64 / 16000.0 - 5.16).abs() < 0.5);
+    }
 
     #[test]
     fn test_to_whisper_format_mono_16k() {
@@ -828,10 +844,15 @@ mod tests {
     fn ogg_opus_and_vorbis_decode_with_bundled_ffmpeg() {
         let ffmpeg = find_ffmpeg_path().expect("FFmpeg is required for the import regression test");
         let directory = tempfile::tempdir().unwrap();
-        for codec in ["libopus", "libvorbis"] {
+        // FFmpeg's own Vorbis encoder (experimental, stereo only) exists in
+        // every build; libvorbis is missing from some, e.g. Homebrew's, which
+        // `find_ffmpeg_path` picks when tests run outside the app bundle.
+        for (codec, extra) in [("libopus", &[][..]), ("vorbis", &["-strict", "-2", "-ac", "2"][..])] {
             let input = directory.path().join(format!("{codec}.OGG"));
             let output = Command::new(&ffmpeg)
-                .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-c:a", codec, "-y"])
+                .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=0.2", "-c:a", codec])
+                .args(extra)
+                .arg("-y")
                 .arg(&input)
                 .output()
                 .unwrap();

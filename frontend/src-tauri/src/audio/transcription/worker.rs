@@ -60,8 +60,12 @@ pub struct TranscriptUpdate {
 }
 
 fn should_emit_transcript(transcript: &str, _confidence: Option<f32>) -> bool {
-    // Confidence is currently a text-length heuristic, not a model probability.
-    !transcript.trim().is_empty()
+    let trimmed = transcript.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Content alone cannot distinguish a valid short reply from hallucination.
+    true
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -75,11 +79,11 @@ pub fn start_transcription_task<R: Runtime>(
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
 
-        let initial_prompt = match app.try_state::<AppState>() {
+        let vocabulary = match app.try_state::<AppState>() {
             Some(state) => match VocabularyRepository::get_effective(state.db_manager.pool(), None).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
-                    warn!("Failed to load Whisper vocabulary: {}", error);
+                    warn!("Failed to load transcription vocabulary: {}", error);
                     None
                 }
             },
@@ -121,7 +125,7 @@ pub fn start_transcription_task<R: Runtime>(
                 TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
             };
             let app_clone = app.clone();
-            let initial_prompt_clone = initial_prompt.clone();
+            let vocabulary_clone = vocabulary.clone();
             let work_receiver_clone = work_receiver.clone();
             let chunks_completed_clone = chunks_completed.clone();
             let input_finished_clone = input_finished.clone();
@@ -189,7 +193,10 @@ pub fn start_transcription_task<R: Runtime>(
                             // display name). System audio is remote parties →
                             // diarize into Speaker N when models are available.
                             crate::audio::common::mark_stt_activity();
-                            let chunk_source = match &chunk.device_type {
+                        let nemotron_remote = matches!(chunk.device_type, crate::audio::recording_state::DeviceType::System)
+                            && crate::diarization::live_nemotron::active();
+                        let profile_samples = nemotron_remote.then(|| chunk.data.clone());
+                        let mut chunk_source = match &chunk.device_type {
                                 crate::audio::recording_state::DeviceType::Microphone => {
                                     // Still feed the online diarizer so it learns the
                                     // user's voice embedding for later offline refine.
@@ -208,7 +215,7 @@ pub fn start_transcription_task<R: Runtime>(
                                             // System path shouldn't be the user; keep a speaker id.
                                             format!("Speaker {}", s.index + 1)
                                         }
-                                        Some(s) => format!("Speaker {}", s.index + 1),
+                                        Some(s) => s.profile_name.unwrap_or_else(|| format!("Speaker {}", s.index + 1)),
                                         None => "Guest".to_string(),
                                     }
                                 }
@@ -223,11 +230,21 @@ pub fn start_transcription_task<R: Runtime>(
                             match transcribe_chunk_with_provider(
                                 &engine_clone,
                                 chunk,
-                                initial_prompt_clone.as_deref(),
+                            vocabulary_clone.as_deref(),
                             )
                             .await
                             {
-                                Ok((transcript, confidence_opt, is_partial)) => {
+                            Ok((transcript, confidence_opt, is_partial)) => {
+                                if nemotron_remote {
+                                    // Inference runs concurrently with ASR. Wait only for bounded
+                                    // lookahead here, never on the capture or Tokio worker thread.
+                                    chunk_source = tokio::task::spawn_blocking(move || {
+                                        let label = crate::diarization::live_nemotron::label(chunk_timestamp, chunk_duration)?;
+                                        let name = profile_samples.as_deref()
+                                            .and_then(|samples| crate::diarization::voice_profiles::name_live_nemotron_turn(&label, samples));
+                                        Some(name.unwrap_or(label))
+                                    }).await.ok().flatten().unwrap_or_else(|| "Guest".into());
+                                }
                                     let confidence_str = match confidence_opt {
                                         Some(c) => format!("{:.2}", c),
                                         None => "N/A".to_string(),
@@ -475,7 +492,7 @@ pub fn start_transcription_task<R: Runtime>(
 async fn transcribe_chunk_with_provider(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
-    initial_prompt: Option<&str>,
+    vocabulary: Option<&str>,
 ) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
@@ -499,14 +516,27 @@ async fn transcribe_chunk_with_provider(
         });
     }
 
-    // Calculate energy for logging/monitoring only
+    // Calculate energy
     let energy: f32 =
         speech_samples.iter().map(|&x| x * x).sum::<f32>() / speech_samples.len() as f32;
+    let rms = energy.sqrt();
+    let peak = speech_samples.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+
+    // Skip silent chunks to avoid Whisper silence hallucinations
+    if peak == 0.0 {
+        info!(
+            "Audio chunk {} has near-zero energy (rms: {:.6}, peak: {:.6}), skipping transcription",
+            chunk.chunk_id, rms, peak
+        );
+        return Ok((String::new(), Some(1.0), false));
+    }
+
     info!(
-        "Processing speech audio chunk {} with {} samples (energy: {:.6})",
+        "Processing speech audio chunk {} with {} samples (rms: {:.6}, peak: {:.6})",
         chunk.chunk_id,
         speech_samples.len(),
-        energy
+        rms,
+        peak
     );
 
     // Transcribe using the appropriate engine (with improved error handling)
@@ -516,7 +546,7 @@ async fn transcribe_chunk_with_provider(
             let language = crate::get_language_preference_internal();
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language, initial_prompt)
+                .transcribe_audio_with_confidence(speech_samples, language, vocabulary)
                 .await
             {
                 Ok((text, confidence, is_partial)) => {
@@ -524,6 +554,9 @@ async fn transcribe_chunk_with_provider(
                     if cleaned_text.is_empty() {
                         return Ok((String::new(), Some(confidence), is_partial));
                     }
+
+                    // Quiet replies such as "you" and "thanks" remain valid speech.
+                    // Native no-speech checks own rejection, not a phrase blacklist.
 
                     info!(
                         "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
@@ -544,7 +577,7 @@ async fn transcribe_chunk_with_provider(
             }
         }
         TranscriptionEngine::Parakeet(parakeet_engine) => {
-            match parakeet_engine.transcribe_audio(speech_samples).await {
+            match parakeet_engine.transcribe_audio(speech_samples, vocabulary).await {
                 Ok(text) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
@@ -574,7 +607,7 @@ async fn transcribe_chunk_with_provider(
             // NEW: Trait-based provider (clean, unified interface)
             let language = crate::get_language_preference_internal();
 
-            match provider.transcribe(speech_samples, language).await {
+            match provider.transcribe(speech_samples, language, vocabulary).await {
                 Ok(result) => {
                     let cleaned_text = result.text.trim().to_string();
                     if cleaned_text.is_empty() {
@@ -641,6 +674,9 @@ mod tests {
     #[test]
     fn short_transcript_is_not_rejected_by_placeholder_confidence() {
         assert!(should_emit_transcript("yes", Some(0.13)));
+        assert!(should_emit_transcript("you", Some(0.13)));
+        assert!(should_emit_transcript("You.", Some(0.9)));
+        assert!(should_emit_transcript("thanks", None));
         assert!(!should_emit_transcript("   ", Some(0.9)));
     }
 }

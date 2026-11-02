@@ -7,6 +7,11 @@
         "resources": [
             "templates/*.json",
             "resources/diarization/*"
-        ]
+        ],
+        "linux": {
+            "appimage": {
+                "bundleMediaFramework": true
+            }
+        }
     }
 }

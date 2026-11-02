@@ -1,3 +1,9 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::mpsc::TrySendError;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use super::capture_worker::{capture_end_seconds, CaptureWorker};
 use std::sync::Arc;
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -10,9 +16,16 @@ use super::pipeline::AudioCapture;
 use super::recording_state::{RecordingState, DeviceType};
 use super::capture::{AudioCaptureBackend, get_current_backend};
 
+// A timed-out WASAPI teardown retains native ownership on its cleanup thread.
+// Block new CPAL capture until it finishes rather than accumulating orphaned
+// streams each time the user retries Start.
+#[cfg(target_os = "windows")]
+static NATIVE_CLEANUPS: once_cell::sync::Lazy<super::capture_worker::NativeCleanup> =
+    once_cell::sync::Lazy::new(super::capture_worker::NativeCleanup::default);
+
 #[cfg(target_os = "macos")]
 use super::capture::CoreAudioCapture;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::recording_state::AudioError;
 
 #[cfg(target_os = "linux")]
@@ -24,6 +37,14 @@ use std::sync::atomic::AtomicBool;
 pub enum StreamBackend {
     /// CPAL-based stream (ScreenCaptureKit or default)
     Cpal(Stream),
+    /// CPAL callback only enqueues samples; native DSP and pipeline delivery
+    /// run on a dedicated worker, which is drained before stopping the pipeline.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    CpalWorker {
+        stream: Stream,
+        worker: CaptureWorker<CaptureFrame>,
+        accepting: Arc<AtomicBool>,
+    },
     /// Core Audio direct implementation (macOS only)
     #[cfg(target_os = "macos")]
     CoreAudio {
@@ -35,7 +56,23 @@ pub enum StreamBackend {
         should_stop: Arc<AtomicBool>,
         task: Option<tokio::task::JoinHandle<()>>,
     },
+    /// Windows Process Loopback stream (per-app)
+    #[cfg(windows)]
+    ProcessLoopback {
+        stop_flag: Arc<std::sync::atomic::AtomicBool>,
+        thread_handles: Vec<std::thread::JoinHandle<()>>,
+    },
 }
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub struct CaptureFrame {
+    samples: Vec<f32>,
+    timestamp: f64,
+    muted: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const CAPTURE_QUEUE_BLOCKS: usize = 256;
 
 // SAFETY: While Stream doesn't implement Send, we ensure it's only accessed
 // from the same thread context by using spawn_blocking for operations that cross thread boundaries
@@ -158,6 +195,10 @@ impl AudioStream {
     ) -> Result<Self> {
         info!("Creating CPAL stream for device: {}", device.name);
 
+        #[cfg(target_os = "windows")]
+        anyhow::ensure!(!NATIVE_CLEANUPS.is_pending(),
+            "Previous Windows audio cleanup is still running; retry recording shortly");
+
         // Get the underlying cpal device and config
         let (cpal_device, config) = get_device_and_config(&device).await?;
 
@@ -170,17 +211,95 @@ impl AudioStream {
             state.clone(),
             config.sample_rate().0,
             config.channels(),
-            device_type,
+            device_type.clone(),
             recording_sender,
         );
 
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let capture_worker = if cfg!(target_os = "windows") || device_type == DeviceType::Microphone {
+            let overflowed = Arc::new(AtomicBool::new(false));
+            let worker_overflowed = overflowed.clone();
+            let worker_capture = capture.clone();
+            let worker_state = state.clone();
+            let mut reported_overflow = false;
+            let source = device_type.clone();
+            let worker = CaptureWorker::spawn(CAPTURE_QUEUE_BLOCKS, move |frame: CaptureFrame| {
+                worker_capture.process_audio_data_at(&frame.samples, frame.timestamp, frame.muted);
+                if worker_overflowed.swap(false, Ordering::Relaxed) && !reported_overflow {
+                    warn!("{:?} processing queue overflowed; some audio was lost", source);
+                    worker_state.report_error(AudioError::BufferOverflow);
+                    reported_overflow = true;
+                }
+            })?;
+            Some((worker, overflowed, Arc::new(AtomicBool::new(true))))
+        } else {
+            None
+        };
+
+        // Windows CPAL and macOS mic callbacks only enqueue blocks. Stateful DSP and
+        // pipeline delivery belong to the worker. CPAL timestamps describe the
+        // first captured sample, whereas the mixer consumes block-end seconds.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let on_samples: Arc<dyn Fn(&[f32], &cpal::InputCallbackInfo) + Send + Sync> = if let Some((worker, overflowed, accepting)) = &capture_worker {
+            let sender = worker.sender();
+            let overflowed = overflowed.clone();
+            let state = state.clone();
+            let accepting = accepting.clone();
+            let sample_rate = config.sample_rate().0;
+            let channels = config.channels();
+            Arc::new(move |samples, info| {
+                if !accepting.load(Ordering::Acquire) || !state.is_recording() || state.is_paused() {
+                    return;
+                }
+                let times = info.timestamp();
+                let timestamp = capture_end_seconds(
+                    state.get_active_recording_duration().unwrap_or(0.0),
+                    samples.len(), channels, sample_rate,
+                    times.callback.duration_since(&times.capture),
+                );
+                if let Err(TrySendError::Full(_)) = sender.try_send(CaptureFrame {
+                    samples: samples.to_vec(),
+                    timestamp,
+                    muted: state.is_audio_source_muted(&device_type),
+                }) {
+                    overflowed.store(true, Ordering::Relaxed);
+                }
+            })
+        } else {
+            let capture = capture.clone();
+            let state = state.clone();
+            let sample_rate = config.sample_rate().0;
+            let channels = config.channels();
+            Arc::new(move |samples, info| {
+                let times = info.timestamp();
+                let timestamp = capture_end_seconds(
+                    state.get_active_recording_duration().unwrap_or(0.0),
+                    samples.len(), channels, sample_rate,
+                    times.callback.duration_since(&times.capture),
+                );
+                capture.process_audio_data_at(samples, timestamp, state.is_audio_source_muted(&device_type));
+            })
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let on_samples: Arc<dyn Fn(&[f32], &cpal::InputCallbackInfo) + Send + Sync> = {
+            let capture = capture.clone();
+            Arc::new(move |samples, _| capture.process_audio_data(samples))
+        };
+
         // Build the appropriate stream based on sample format
-        let stream = Self::build_stream(&cpal_device, &config, capture.clone())?;
+        let stream = Self::build_stream(&cpal_device, &config, capture.clone(), on_samples)?;
 
         // Start the stream
         stream.play()?;
         info!("CPAL stream started for device: {}", device.name);
 
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Some((worker, _, accepting)) = capture_worker {
+            return Ok(Self {
+                device,
+                backend: StreamBackend::CpalWorker { stream, worker, accepting },
+            });
+        }
         Ok(Self {
             device,
             backend: StreamBackend::Cpal(stream),
@@ -195,13 +314,25 @@ impl AudioStream {
         device_type: DeviceType,
         recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
     ) -> Result<Self> {
-        info!("🔊 Stream: Creating Core Audio stream for device: {}", device.name);
+        Self::create_core_audio_stream_with_process(device, state, device_type, recording_sender, None).await
+    }
+
+    /// Create a Core Audio stream optionally targeting a specific process PID (macOS only)
+    #[cfg(target_os = "macos")]
+    async fn create_core_audio_stream_with_process(
+        device: Arc<AudioDevice>,
+        state: Arc<RecordingState>,
+        device_type: DeviceType,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+        target_pid: Option<u32>,
+    ) -> Result<Self> {
+        info!("🔊 Stream: Creating Core Audio stream (target_pid: {:?}) for device: {}", target_pid, device.name);
 
         // Create Core Audio capture
-        info!("🔊 Stream: Calling CoreAudioCapture::new()...");
-        let capture_impl = CoreAudioCapture::new()
+        info!("🔊 Stream: Calling CoreAudioCapture::new_with_process()...");
+        let capture_impl = CoreAudioCapture::new_with_process(target_pid)
             .map_err(|e| {
-                error!("❌ Stream: CoreAudioCapture::new() failed: {}", e);
+                error!("❌ Stream: CoreAudioCapture::new_with_process failed: {}", e);
                 anyhow::anyhow!("Failed to create Core Audio capture: {}", e)
             })?;
 
@@ -242,6 +373,7 @@ impl AudioStream {
                 let mut frame_count = 0;
                 let frames_per_chunk = 1024; // Process in chunks of 1024 samples
                 let mut terminal_error_reported = false;
+                let mut stalled = false;
 
                 info!("✅ Stream: Core Audio processing task started for {}", device_name);
 
@@ -253,16 +385,30 @@ impl AudioStream {
                     )
                     .await
                     {
-                        Ok(Some(sample)) => sample,
+                        Ok(Some(sample)) => {
+                            if stalled {
+                                info!("Core Audio callbacks resumed for {}", device_name);
+                                stalled = false;
+                            }
+                            sample
+                        }
                         Ok(None) => break,
                         Err(_) => {
-                            error!(
-                                "Core Audio stopped delivering callbacks for {}",
-                                device_name
-                            );
-                            state_for_stream.report_error(AudioError::ChannelClosed);
-                            terminal_error_reported = true;
-                            break;
+                            if !state_for_stream.is_recording() {
+                                break;
+                            }
+                            // A stalled system tap must not end the meeting: the
+                            // microphone keeps recording, the user is warned once
+                            // per stall, and samples resume if the tap recovers.
+                            if !stalled {
+                                warn!(
+                                    "Core Audio delivered no samples for 5 s on {}; continuing with the microphone",
+                                    device_name
+                                );
+                                state_for_stream.report_warning(AudioError::SystemCaptureStalled);
+                                stalled = true;
+                            }
+                            continue;
                         }
                     };
                     let current_sample_rate = stream.sample_rate();
@@ -298,7 +444,7 @@ impl AudioStream {
 
                 if !terminal_error_reported && state_for_stream.is_recording() {
                     error!("Core Audio stream ended unexpectedly for {}", device_name);
-                    state_for_stream.report_error(AudioError::ChannelClosed);
+                    state_for_stream.report_error(AudioError::SystemCaptureEnded);
                 }
 
                 info!("⚠️ Stream: Core Audio processing task ended for {}", device_name);
@@ -445,11 +591,97 @@ impl AudioStream {
         })
     }
 
+    /// Create a per-application audio stream targeting multiple or single applications
+    pub async fn create_per_app_stream(
+        targets: Vec<crate::audio::recording_preferences::PerAppTarget>,
+        state: Arc<RecordingState>,
+        _device_type: DeviceType,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+    ) -> Result<Self> {
+        info!("🎯 Creating per-app audio stream for {} target(s)", targets.len());
+
+        #[cfg(target_os = "windows")]
+        anyhow::ensure!(!NATIVE_CLEANUPS.is_pending(),
+            "Previous Windows audio cleanup is still running; retry recording shortly");
+
+        #[cfg(target_os = "macos")]
+        if targets.len() > 1 {
+            anyhow::bail!("macOS currently supports one selected app at a time. Select one app or use all computer audio.");
+        }
+
+        let mut running_targets = Vec::new();
+        for target in &targets {
+            if let Some(pid) = crate::audio::capture::per_app::find_pid_for_app(&target.executable) {
+                info!("🎯 Found active PID {} for target app '{}' ({})", pid, target.name, target.executable);
+                running_targets.push((target.name.clone(), pid));
+            } else {
+                warn!("⚠️ Target app '{}' ({}) is not currently running", target.name, target.executable);
+            }
+        }
+
+        if running_targets.is_empty() {
+            let target_summary: Vec<String> = targets.iter().map(|t| format!("{} ({})", t.name, t.executable)).collect();
+            return Err(anyhow::anyhow!(
+                "None of the target applications are currently running: {}. Please launch at least one application before recording.",
+                target_summary.join(", ")
+            ));
+        }
+
+        let display_names: Vec<String> = running_targets.iter().map(|(name, _)| name.clone()).collect();
+        let device = Arc::new(AudioDevice {
+            name: format!("App Audio: {}", display_names.join(", ")),
+            device_type: super::devices::DeviceType::Output,
+        });
+
+        #[cfg(windows)]
+        {
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let capture_device = device.clone();
+            let capture_stop = stop_flag.clone();
+            let thread_handles = tokio::task::spawn_blocking(move || {
+                crate::audio::capture::per_app::windows_loopback::start_multi_process_loopback(
+                    capture_device,
+                    state,
+                    recording_sender,
+                    running_targets,
+                    capture_stop,
+                )
+            }).await??;
+
+            Ok(Self {
+                device,
+                backend: StreamBackend::ProcessLoopback {
+                    stop_flag,
+                    thread_handles,
+                },
+            })
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let first_pid = running_targets[0].1;
+            Self::create_core_audio_stream_with_process(
+                device,
+                state,
+                _device_type,
+                recording_sender,
+                Some(first_pid),
+            ).await
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = (state, _device_type, recording_sender);
+            Err(anyhow::anyhow!("Per-app audio recording is only supported on Windows and macOS."))
+        }
+    }
+
     /// Build stream based on sample format
     fn build_stream(
         device: &Device,
         config: &SupportedStreamConfig,
         capture: AudioCapture,
+        on_samples: Arc<dyn Fn(&[f32], &cpal::InputCallbackInfo) + Send + Sync>,
     ) -> Result<Stream> {
         let config_copy = config.clone();
 
@@ -458,8 +690,8 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        capture.process_audio_data(data);
+                    move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                        on_samples(data, info);
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -471,11 +703,11 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    move |data: &[i16], info: &cpal::InputCallbackInfo| {
                         let f32_data: Vec<f32> = data.iter()
                             .map(|&sample| sample as f32 / i16::MAX as f32)
                             .collect();
-                        capture.process_audio_data(&f32_data);
+                        on_samples(&f32_data, info);
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -487,11 +719,11 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    move |data: &[i32], info: &cpal::InputCallbackInfo| {
                         let f32_data: Vec<f32> = data.iter()
                             .map(|&sample| sample as f32 / i32::MAX as f32)
                             .collect();
-                        capture.process_audio_data(&f32_data);
+                        on_samples(&f32_data, info);
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -503,11 +735,11 @@ impl AudioStream {
                 let capture_clone = capture.clone();
                 device.build_input_stream(
                     &config_copy.into(),
-                    move |data: &[i8], _: &cpal::InputCallbackInfo| {
+                    move |data: &[i8], info: &cpal::InputCallbackInfo| {
                         let f32_data: Vec<f32> = data.iter()
                             .map(|&sample| sample as f32 / i8::MAX as f32)
                             .collect();
-                        capture.process_audio_data(&f32_data);
+                        on_samples(&f32_data, info);
                     },
                     move |err| {
                         capture_clone.handle_stream_error(err);
@@ -546,7 +778,59 @@ impl AudioStream {
     }
 
     /// Stop the stream and wait for its capture thread/task to finish.
+    ///
+    /// Async because the Linux Pulse backend awaits its blocking capture thread
+    /// with a bounded timeout. Every other backend stops synchronously through
+    /// `stop_inner`, which Windows runs under its native-cleanup guard.
     pub async fn stop(self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if matches!(self.backend, StreamBackend::Pulse { .. }) {
+            return self.stop_pulse().await;
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let StreamBackend::CpalWorker { accepting, .. } = &self.backend {
+            accepting.store(false, Ordering::Release);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // WASAPI's public Stream drop joins its native thread without a
+            // timeout. Own that drop off the caller, with explicit completion
+            // and a guard that keeps new capture blocked while cleanup lives.
+            return NATIVE_CLEANUPS.run(move || self.stop_inner().map_err(|error| error.to_string()),
+                std::time::Duration::from_secs(3)).map_err(anyhow::Error::msg);
+        }
+        #[cfg(not(target_os = "windows"))]
+        self.stop_inner()
+    }
+
+    /// Stop a native PulseAudio/PipeWire stream (Linux only).
+    #[cfg(target_os = "linux")]
+    async fn stop_pulse(self) -> Result<()> {
+        info!("Stopping audio stream for device: {}", self.device.name);
+        if let StreamBackend::Pulse { should_stop, task } = self.backend {
+            // Signal the blocking capture thread to stop after its current
+            // read() call returns, then await its JoinHandle with a bounded
+            // timeout. abort() on a spawn_blocking task that has already
+            // started is a no-op, so waiting is the only reliable way to
+            // know the thread has actually exited.
+            info!("Signalling PulseAudio capture thread to stop...");
+            should_stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(task_handle) = task {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await {
+                    Ok(Ok(())) => info!("PulseAudio capture thread joined cleanly"),
+                    Ok(Err(e)) => warn!("PulseAudio capture thread panicked: {}", e),
+                    Err(_) => warn!(
+                        "PulseAudio capture thread did not stop within 2s, abandoning join (thread may still be running)"
+                    ),
+                }
+            }
+        }
+        drop(self.device);
+        info!("Audio stream stopped and device reference dropped");
+        Ok(())
+    }
+
+    fn stop_inner(self) -> Result<()> {
         info!("Stopping audio stream for device: {}", self.device.name);
 
         match self.backend {
@@ -559,6 +843,19 @@ impl AudioStream {
                 }
                 info!("Stream paused, now dropping to release callbacks");
                 drop(stream);
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            StreamBackend::CpalWorker { stream, mut worker, .. } => {
+                if let Err(error) = stream.pause() {
+                    warn!("Failed to pause capture stream: {}", error);
+                }
+                drop(stream);
+                // CPAL's macOS disconnect listener can retain the callback and
+                // its sender after drop. Explicitly close/drain instead of
+                // waiting for channel disconnection, with a bounded DSP wait.
+                worker
+                    .stop(std::time::Duration::from_secs(2))
+                    .map_err(|error| anyhow::anyhow!("Capture worker shutdown failed ({:?}); queued audio may be incomplete", error))?;
             }
             #[cfg(target_os = "macos")]
             StreamBackend::CoreAudio { task } => {
@@ -573,28 +870,20 @@ impl AudioStream {
                 }
             }
             #[cfg(target_os = "linux")]
-            StreamBackend::Pulse { should_stop, task } => {
-                // Signal the blocking capture thread to stop after its current
-                // read() call returns, then await its JoinHandle with a bounded
-                // timeout. abort() on a spawn_blocking task that has already
-                // started is a no-op, so waiting is the only reliable way to
-                // know the thread has actually exited.
-                info!("Signalling PulseAudio capture thread to stop...");
+            StreamBackend::Pulse { should_stop, .. } => {
+                // stop() routes Pulse streams to stop_pulse(), which waits for
+                // the thread. Reaching here means a caller bypassed that path,
+                // so at least signal the capture thread to exit.
                 should_stop.store(true, std::sync::atomic::Ordering::Release);
-                if let Some(task_handle) = task {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        task_handle,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => info!("PulseAudio capture thread joined cleanly"),
-                        Ok(Err(e)) => warn!("PulseAudio capture thread panicked: {}", e),
-                        Err(_) => warn!(
-                            "PulseAudio capture thread did not stop within 2s, abandoning join (thread may still be running)"
-                        ),
-                    }
+            }
+            #[cfg(windows)]
+            StreamBackend::ProcessLoopback { stop_flag, thread_handles } => {
+                info!("Stopping Windows process loopback stream(s)...");
+                stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                for handle in thread_handles {
+                    let _ = handle.join();
                 }
+                info!("Windows process loopback stream(s) stopped");
             }
         }
 
@@ -624,16 +913,17 @@ impl AudioStreamManager {
         }
     }
 
-    /// Start audio streams for the given devices
-    pub async fn start_streams(
+    /// Start audio streams with optional per-app audio capture for system sound
+    pub async fn start_streams_with_per_app(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,
         system_device: Option<Arc<AudioDevice>>,
+        per_app_targets: Option<Vec<crate::audio::recording_preferences::PerAppTarget>>,
         recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
     ) -> Result<()> {
         use super::capture::get_current_backend;
         let backend = get_current_backend();
-        info!("🎙️ Starting audio streams with backend: {:?}", backend);
+        info!("🎙️ Starting audio streams with backend: {:?}, per-app: {:?}", backend, per_app_targets.is_some());
 
         // Start microphone stream
         if let Some(mic_device) = microphone_device {
@@ -655,8 +945,28 @@ impl AudioStreamManager {
             info!("ℹ️ No microphone device specified, skipping microphone stream");
         }
 
-        // Start system audio stream
-        if let Some(sys_device) = system_device {
+        // Start system audio stream or per-app stream
+        if let Some(targets) = per_app_targets {
+            info!("🎯 Creating per-app audio stream for {} target(s)", targets.len());
+            match AudioStream::create_per_app_stream(
+                targets,
+                self.state.clone(),
+                DeviceType::System,
+                recording_sender.clone(),
+            ).await {
+                Ok(stream) => {
+                    self.state.set_system_device(stream.device().clone().into());
+                    self.state.set_capture_active(DeviceType::System, true);
+                    self.system_stream = Some(stream);
+                    info!("✅ Per-app audio stream created for targets");
+                }
+                Err(e) => {
+                    warn!("⚠️ Failed to create per-app audio stream: {}", e);
+                    self.state.finish_capture_setup();
+                    return Err(e);
+                }
+            }
+        } else if let Some(sys_device) = system_device {
             info!("🔊 Creating system audio stream: {} (backend: {:?})", sys_device.name, backend);
             match AudioStream::create(sys_device.clone(), self.state.clone(), DeviceType::System, recording_sender.clone()).await {
                 Ok(stream) => {
@@ -682,6 +992,16 @@ impl AudioStreamManager {
 
         self.state.finish_capture_setup();
         Ok(())
+    }
+
+    /// Start audio streams for the given devices
+    pub async fn start_streams(
+        &mut self,
+        microphone_device: Option<Arc<AudioDevice>>,
+        system_device: Option<Arc<AudioDevice>>,
+        recording_sender: Option<mpsc::UnboundedSender<super::recording_state::AudioChunk>>,
+    ) -> Result<()> {
+        self.start_streams_with_per_app(microphone_device, system_device, None, recording_sender).await
     }
 
     /// Stop all audio streams and wait for each capture thread to finish.

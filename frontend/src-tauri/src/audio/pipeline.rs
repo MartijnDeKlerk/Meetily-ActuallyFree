@@ -68,12 +68,49 @@ struct AudioMixerRingBuffer {
     mic_buffer: VecDeque<f32>,
     system_buffer: VecDeque<f32>,
     window_size_samples: usize,  // Fixed mixing window (e.g., 50ms)
-    max_buffer_size: usize,  // Safety limit (e.g., 100ms)
+    max_buffer_size: usize,  // Maximum queued lead before a missing source is padded
     mic_enabled: bool,
     system_enabled: bool,
     sample_rate: f64,
     timeline_origin: Option<f64>,
     output_samples: usize,
+    mic_clock: Option<SourceSampleClock>,
+    system_clock: Option<SourceSampleClock>,
+    input_blocks: u64,
+    continuity: MixerContinuity,
+}
+
+#[derive(Default)]
+struct MixerContinuity {
+    padded: [u64; 2],
+    discarded: [u64; 2],
+    events: u64,
+}
+
+impl MixerContinuity {
+    fn record(&mut self, source: &DeviceType, padded: usize, discarded: usize) {
+        if padded == 0 && discarded == 0 { return; }
+        let index = match source {
+            DeviceType::Microphone => 0,
+            DeviceType::System => 1,
+            DeviceType::Mixed => return,
+        };
+        self.padded[index] += padded as u64;
+        self.discarded[index] += discarded as u64;
+        self.events += 1;
+        // Local, rate-limited diagnostics distinguish mixer loss from capture
+        // or ASR failures without logging audio or transcript content.
+        if self.events == 1 || self.events % 64 == 0 {
+            warn!("Audio mixer continuity: padded mic/system={:?} samples, discarded late mic/system={:?} samples, events={}",
+                self.padded, self.discarded, self.events);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SourceSampleClock {
+    next_sample: usize,
+    last_callback_end_seconds: f64,
 }
 
 impl AudioMixerRingBuffer {
@@ -89,11 +126,11 @@ impl AudioMixerRingBuffer {
     ) -> Self {
         let window_size_samples = ((sample_rate as f32 * window_ms / 1000.0) as usize).max(1);
 
-        // CRITICAL FIX: Increase max buffer to 400ms for system audio stability
-        // System audio (especially Core Audio on macOS) can have significant jitter
-        // due to sample-by-sample streaming → batching → channel transmission
-        // Accounts for: RNNoise buffering + Core Audio jitter + processing delays
-        let max_buffer_size = window_size_samples * 8;  // 400ms (was 200ms)
+        // Allow up to 400 ms of source lead at the production 50 ms window.
+        // This is a waiting budget, not permission to discard incoming samples.
+        // add_samples may exceed it by one callback; the caller then drains
+        // windows until only the budget plus a partial window remains.
+        let max_buffer_size = window_size_samples * 8;
 
         info!(
             "🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
@@ -113,6 +150,10 @@ impl AudioMixerRingBuffer {
             sample_rate: sample_rate as f64,
             timeline_origin: None,
             output_samples: 0,
+            mic_clock: None,
+            system_clock: None,
+            input_blocks: 0,
+            continuity: MixerContinuity::default(),
         }
     }
 
@@ -121,30 +162,79 @@ impl AudioMixerRingBuffer {
         self.system_enabled = system_enabled;
     }
 
+    fn incoming_position(
+        &self,
+        device_type: &DeviceType,
+        sample_count: usize,
+        timestamp: f64,
+    ) -> Option<(f64, usize)> {
+        if sample_count == 0 || matches!(device_type, DeviceType::Mixed) {
+            return None;
+        }
+        let duration = sample_count as f64 / self.sample_rate;
+        let start = (timestamp - duration).max(0.0);
+        let origin = self.timeline_origin.unwrap_or(start);
+        let wall_start = ((start - origin).max(0.0) * self.sample_rate).round() as usize;
+        let clock = match device_type {
+            DeviceType::Microphone => self.mic_clock,
+            DeviceType::System => self.system_clock,
+            DeviceType::Mixed => return None,
+        };
+        // Some backends only provide delivery times, not hardware capture times.
+        // Repositioning each block inserts/drops samples at every jittering edge
+        // (issue #40). Anchor each source once, then count its actual samples.
+        // A callback-free gap over 100 ms reanchors to wall time; smaller timing
+        // fluctuations must not splice a continuous waveform. This is distinct
+        // from the queued-lead budget before padding a missing source.
+        const CALLBACK_GAP_SECONDS: f64 = 0.100;
+        let mut chunk_start = match clock {
+            Some(clock) if start - clock.last_callback_end_seconds <= CALLBACK_GAP_SECONDS => clock.next_sample,
+            _ => wall_start,
+        };
+        let current_len = match device_type {
+            DeviceType::Microphone => self.mic_buffer.len(),
+            DeviceType::System => self.system_buffer.len(),
+            DeviceType::Mixed => return None,
+        };
+        // If a source missed a mixing deadline, silence has already consumed
+        // those positions. A short loss (<100 ms) otherwise leaves its sample
+        // clock behind forever: every new callback can be trimmed as stale.
+        // Recover only when capture time itself reaches the un-emitted timeline;
+        // genuinely old queued blocks must still be discarded, not moved forward.
+        let missed_window = clock.map(|clock| {
+            start - clock.last_callback_end_seconds > self.window_size_samples as f64 / self.sample_rate
+        }).unwrap_or(false);
+        if current_len == 0 && wall_start >= self.output_samples
+            && (chunk_start < self.output_samples || missed_window)
+        {
+            chunk_start = wall_start;
+        }
+        Some((start, chunk_start))
+    }
+
+    fn needs_timeline_reset(&self, source: &DeviceType, count: usize, timestamp: f64) -> bool {
+        let Some((_, chunk_start)) = self.incoming_position(source, count, timestamp) else { return false; };
+        let pending = match source {
+            DeviceType::Microphone => self.mic_buffer.len(),
+            DeviceType::System => self.system_buffer.len(),
+            DeviceType::Mixed => return false,
+        };
+        chunk_start.saturating_sub(self.output_samples + pending) > self.max_buffer_size
+    }
+
     fn add_samples(
         &mut self,
         device_type: DeviceType,
         mut samples: Vec<f32>,
         timestamp: f64,
     ) -> Option<f64> {
-        // Log buffer health periodically for diagnostics
-        static mut SAMPLE_COUNTER: u64 = 0;
-        unsafe {
-            SAMPLE_COUNTER += 1;
-            if SAMPLE_COUNTER % 200 == 0 {
-                debug!(
-                    "📊 Ring buffer status: mic={} samples, sys={} samples (max={})",
-                    self.mic_buffer.len(),
-                    self.system_buffer.len(),
-                    self.max_buffer_size
-                );
-            }
+        let (start, mut chunk_start) = self.incoming_position(&device_type, samples.len(), timestamp)?;
+        self.timeline_origin.get_or_insert(start);
+        self.input_blocks += 1;
+        if self.input_blocks % 200 == 0 {
+            debug!("Ring buffer status: mic={} samples, sys={} samples (waiting budget={})",
+                self.mic_buffer.len(), self.system_buffer.len(), self.max_buffer_size);
         }
-
-        let duration = samples.len() as f64 / self.sample_rate;
-        let start = (timestamp - duration).max(0.0);
-        let origin = *self.timeline_origin.get_or_insert(start);
-        let mut chunk_start = ((start - origin).max(0.0) * self.sample_rate).round() as usize;
         let current_len = match device_type {
             DeviceType::Microphone => self.mic_buffer.len(),
             DeviceType::System => self.system_buffer.len(),
@@ -153,26 +243,44 @@ impl AudioMixerRingBuffer {
         let buffered_end = self.output_samples + current_len;
         let mut discontinuity_start = None;
         if chunk_start.saturating_sub(buffered_end) > self.max_buffer_size {
+            // The pipeline must persist the old tail before changing origins.
+            debug_assert!(self.mic_buffer.is_empty() && self.system_buffer.is_empty());
             warn!("Audio timeline discontinuity detected; resetting source alignment");
             self.mic_buffer.clear();
             self.system_buffer.clear();
             self.timeline_origin = Some(start);
             self.output_samples = 0;
+            self.mic_clock = None;
+            self.system_clock = None;
             chunk_start = 0;
             discontinuity_start = Some(start);
         }
 
+        // Advance even when output already contains silence for a late block:
+        // trimming that already-emitted prefix must not skew the next block.
+        let next_clock = Some(SourceSampleClock {
+            next_sample: chunk_start.saturating_add(samples.len()),
+            last_callback_end_seconds: timestamp,
+        });
         let buffer = match device_type {
-            DeviceType::Microphone => &mut self.mic_buffer,
-            DeviceType::System => &mut self.system_buffer,
+            DeviceType::Microphone => {
+                self.mic_clock = next_clock;
+                &mut self.mic_buffer
+            }
+            DeviceType::System => {
+                self.system_clock = next_clock;
+                &mut self.system_buffer
+            }
             DeviceType::Mixed => return None,
         };
 
         let buffered_end = self.output_samples + buffer.len();
         if chunk_start > buffered_end {
+            self.continuity.record(&device_type, chunk_start - buffered_end, 0);
             buffer.extend(std::iter::repeat(0.0).take(chunk_start - buffered_end));
         } else if chunk_start < buffered_end {
             let overlap = buffered_end - chunk_start;
+            self.continuity.record(&device_type, 0, overlap.min(samples.len()));
             if overlap >= samples.len() {
                 return discontinuity_start;
             }
@@ -180,29 +288,9 @@ impl AudioMixerRingBuffer {
         }
         buffer.extend(samples);
 
-        // CRITICAL FIX: Add warnings before dropping samples
-        // This helps diagnose timing issues in production
-        if self.mic_buffer.len() > self.max_buffer_size {
-            warn!(
-                "⚠️ Microphone buffer overflow: {} > {} samples, dropping oldest {} samples",
-                self.mic_buffer.len(),
-                self.max_buffer_size,
-                self.mic_buffer.len() - self.max_buffer_size
-            );
-        }
-        if self.system_buffer.len() > self.max_buffer_size {
-            error!("🔴 SYSTEM AUDIO BUFFER OVERFLOW: {} > {} samples, dropping {} samples - THIS CAUSES DISTORTION!",
-                  self.system_buffer.len(), self.max_buffer_size,
-                  self.system_buffer.len() - self.max_buffer_size);
-        }
-
-        // Safety: prevent buffer overflow (keep only last 200ms)
-        while self.mic_buffer.len() > self.max_buffer_size {
-            self.mic_buffer.pop_front();
-        }
-        while self.system_buffer.len() > self.max_buffer_size {
-            self.system_buffer.pop_front();
-        }
+        // Drain via extract_window before imposing any further waiting. Popping
+        // a source's oldest samples here both loses audio and moves its remaining
+        // samples to the wrong timeline positions without advancing its clock.
         discontinuity_start
     }
 
@@ -210,14 +298,26 @@ impl AudioMixerRingBuffer {
         let all_ready = (!self.mic_enabled || self.mic_buffer.len() >= self.window_size_samples)
             && (!self.system_enabled || self.system_buffer.len() >= self.window_size_samples)
             && (self.mic_enabled || self.system_enabled);
-        let surviving_source_ahead =
-            self.mic_buffer.len().max(self.system_buffer.len()) >= self.window_size_samples * 2;
+        // The next complete window must be past the waiting budget. Counting
+        // that window as part of the budget pads up to 50 ms too early when the
+        // delayed source has only a partial window ready.
+        let surviving_source_ahead = self.mic_buffer.len().max(self.system_buffer.len())
+            >= self.max_buffer_size + self.window_size_samples;
         all_ready || surviving_source_ahead
     }
 
     fn extract_window(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
         if !self.can_mix() {
             return None;
+        }
+
+        if self.mic_enabled {
+            self.continuity.record(&DeviceType::Microphone,
+                self.window_size_samples.saturating_sub(self.mic_buffer.len()), 0);
+        }
+        if self.system_enabled {
+            self.continuity.record(&DeviceType::System,
+                self.window_size_samples.saturating_sub(self.system_buffer.len()), 0);
         }
 
         // Extract mic window with zero-padding for incomplete buffers
@@ -234,7 +334,7 @@ impl AudioMixerRingBuffer {
             padded.extend_from_slice(&available);
 
             // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
+            // Missing input is represented as silence, which may be audible.
             padded.resize(self.window_size_samples, 0.0);
 
             padded
@@ -256,7 +356,7 @@ impl AudioMixerRingBuffer {
             padded.extend_from_slice(&available);
 
             // Use zero-padding (silence) to prevent repetition artifacts
-            // Zero-padding is inaudible at 48kHz sample rate
+            // Missing input is represented as silence, which may be audible.
             padded.resize(self.window_size_samples, 0.0);
 
             padded
@@ -385,6 +485,7 @@ pub struct AudioCapture {
     channels: u16,
     chunk_counter: Arc<std::sync::atomic::AtomicU64>,
     device_type: DeviceType,
+    #[allow(dead_code)]
     recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
     needs_resampling: bool,  // Flag if resampling is required
     // CRITICAL FIX: Persistent resampler to preserve energy across chunks
@@ -592,12 +693,25 @@ impl AudioCapture {
 
     /// Process audio data directly from callback
     pub fn process_audio_data(&self, data: &[f32]) {
+        self.process_audio_data_inner(data, None, false);
+    }
+
+    /// The mic worker must use capture time, not the time it drains a queued block.
+    /// Otherwise a busy transcriber shifts saved audio and can make continuous
+    /// microphone samples look like a late/reconnected source in the mixer.
+    pub fn process_audio_data_at(&self, data: &[f32], timestamp: f64, muted_at_capture: bool) {
+        self.process_audio_data_inner(data, Some(timestamp), muted_at_capture);
+    }
+
+    fn process_audio_data_inner(&self, data: &[f32], callback_timestamp: Option<f64>, muted_at_capture: bool) {
         // Check if still recording
         if !self.state.is_recording() {
             return;
         }
 
-        let source_muted_at_capture = self.state.is_audio_source_muted(&self.device_type);
+        // A queued block may outlive a mute/unmute command. Preserve its capture
+        // decision as well as the current mute state, including after stateful DSP.
+        let source_muted_at_capture = muted_at_capture || self.state.is_audio_source_muted(&self.device_type);
 
         // Convert to mono if needed
         let mut mono_data = if self.channels > 1 {
@@ -833,12 +947,12 @@ impl AudioCapture {
         //     }
         // }
 
-        // Use global recording timestamp for proper synchronization
-        let timestamp = self.state.get_active_recording_duration().unwrap_or(0.0);
-
         if self.state.is_audio_source_muted(&self.device_type) {
             mono_data.fill(0.0);
         }
+
+        let timestamp = callback_timestamp
+            .unwrap_or_else(|| self.state.get_active_recording_duration().unwrap_or(0.0));
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
@@ -957,7 +1071,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
-    ) -> Self {
+    ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
         info!(
@@ -979,31 +1093,27 @@ impl AudioPipeline {
         let system_enabled = system_device_name != "No System Audio";
         let _ = (mic_device_kind, system_device_kind);
 
-        // Bridge short natural pauses without adding the two-second latency used by
-        // offline retranscription.
-        let redemption_time = 800;
+        // Fast real-time streaming uses 350ms redemption and 3.5s max utterance capping.
+        // Standard mode uses 800ms redemption and 6.0s max utterance capping.
+        let is_realtime = crate::audio::recording_preferences::is_real_time_transcription();
+        let redemption_time = if is_realtime { 350 } else { 800 };
+        let max_duration_ms = if is_realtime { 3500 } else { 6000 };
 
         // One VAD per capture source so simultaneous talk is segmented independently.
-        let make_vad = |label: &str, positive_threshold, negative_threshold| {
-            match ContinuousVadProcessor::new_with_thresholds(
-            sample_rate,
-            redemption_time,
-            positive_threshold,
-            negative_threshold,
-        ) {
-            Ok(processor) => {
-                info!("VAD ready for {label}: segments go straight to Whisper (no shared mix)");
-                processor
-            }
-            Err(e) => {
-                error!("Failed to create {label} VAD processor: {e}");
-                panic!("VAD processor creation failed: {e}");
-            }
-            }
+        let make_vad = |label: &str, positive_threshold, negative_threshold| -> Result<ContinuousVadProcessor> {
+            let mut processor = ContinuousVadProcessor::new_with_thresholds(
+                sample_rate, redemption_time, positive_threshold, negative_threshold,
+            )?;
+            processor.set_max_speech_duration_ms(max_duration_ms);
+            info!("VAD ready for {label}: separate source segmentation (redemption: {redemption_time}ms, max: {max_duration_ms}ms, real_time: {is_realtime})");
+            Ok(processor)
         };
-        // Headset/array microphones are usually quieter than digital loopback.
-        let mic_vad = make_vad("microphone", 0.20, 0.10);
-        let system_vad = make_vad("system", 0.50, 0.35);
+        // Both sources can contain soft/compressed speech. The old 0.50/0.35
+        // loopback gate discarded entire audible turns in recorded-call replay;
+        // use the same speech-sensitive thresholds as the microphone. This is
+        // a speech-probability gate, not a substitute for volume adjustment.
+        let mic_vad = make_vad("microphone", 0.20, 0.10)?;
+        let system_vad = make_vad("system", 0.20, 0.10)?;
 
         // Initialize professional audio mixing components (recording file only)
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate, mic_enabled, system_enabled);
@@ -1012,7 +1122,7 @@ impl AudioPipeline {
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
 
-        Self {
+        Ok(Self {
             receiver,
             transcription_sender,
             state,
@@ -1036,14 +1146,16 @@ impl AudioPipeline {
             system_limiter_hit_since_emit: false,
             last_mic_input: std::time::Instant::now(),
             last_system_input: std::time::Instant::now(),
-        }
+        })
     }
 
     fn finalize_inactive_speech(&mut self, now: std::time::Instant) {
         if self.state.is_paused() {
             return;
         }
-        let redemption = std::time::Duration::from_millis(800);
+        let is_realtime = crate::audio::recording_preferences::is_real_time_transcription();
+        let redemption_ms = if is_realtime { 350 } else { 800 };
+        let redemption = std::time::Duration::from_millis(redemption_ms);
         let mut completed = Vec::new();
         if now.duration_since(self.last_mic_input) >= redemption {
             if let Some(segment) = self.mic_vad.finalize_active_speech() {
@@ -1074,7 +1186,15 @@ impl AudioPipeline {
         transcription_sender: &mpsc::UnboundedSender<AudioChunk>,
         chunk_id_counter: &mut u64,
     ) {
-        match vad.process_audio(samples) {
+        // Dynamically adjust max speech duration if preference changed during recording
+        let is_realtime = crate::audio::recording_preferences::is_real_time_transcription();
+        vad.set_max_speech_duration_ms(if is_realtime { 3500 } else { 6000 });
+
+        match vad.process_audio_observed(samples, |start, audio| {
+            if matches!(device_type, DeviceType::System) {
+                crate::diarization::live_nemotron::feed(start, audio);
+            }
+        }) {
             Ok(speech_segments) => Self::enqueue_source_speech(
                 speech_segments,
                 device_type,
@@ -1242,6 +1362,12 @@ impl AudioPipeline {
                     if let Some((mic_active, system_active)) = self.state.active_capture_sources() {
                         self.ring_buffer.set_enabled(mic_active, system_active);
                     }
+                    if self.ring_buffer.needs_timeline_reset(&chunk.device_type, chunk.data.len(), chunk.timestamp) {
+                        // A driver/system stall can leave a sub-window tail on
+                        // either source. Save it and finalize VAD before resetting
+                        // both clocks; clearing first silently loses real samples.
+                        self.flush_remaining_audio()?;
+                    }
                     let discontinuity_start = self.ring_buffer.add_samples(
                         chunk.device_type.clone(),
                         chunk.data,
@@ -1269,7 +1395,7 @@ impl AudioPipeline {
 
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
-                        if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+            if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
                             // STEP 3: Transcribe each source independently.
                             // Same wall-clock windows (aligned by the ring buffer),
                             // separate sample streams + VAD state — so when both
@@ -1392,6 +1518,7 @@ impl AudioPipeline {
             }
         }
 
+        crate::diarization::live_nemotron::finish();
         let mic_final = self.mic_vad.flush();
         let sys_final = self.system_vad.flush();
 
@@ -1455,19 +1582,20 @@ impl AudioPipelineManager {
     }
 
     /// Start the audio pipeline with device information for adaptive buffering
-    pub fn start(
+    pub fn start<F>(
         &mut self,
         state: Arc<RecordingState>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
-        recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        create_recording_sender: F,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
         level_sender: Option<mpsc::UnboundedSender<AudioLevels>>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where F: FnOnce() -> Result<mpsc::UnboundedSender<AudioChunk>> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
         info!(
@@ -1482,9 +1610,6 @@ impl AudioPipelineManager {
         // Create audio processing channel
         let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // Set sender in state for audio captures to use
-        state.set_audio_sender(audio_sender.clone());
-
         // Create and start pipeline with device information for adaptive mixing
         let mut pipeline = AudioPipeline::new(
             audio_receiver,
@@ -1496,11 +1621,13 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
-        );
+        ).map_err(crate::onnx_runtime::InitializationError)?;
 
-        // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
-        // This ensures both mic AND system audio are captured in recordings
-        pipeline.recording_sender_for_mixed = recording_sender;
+        // VAD construction must succeed before creating folders or saver tasks.
+        // The fork's saver still validates all three aligned destinations before
+        // exposing a sender. Storage errors retain their own classification.
+        pipeline.recording_sender_for_mixed = Some(create_recording_sender()?);
+        state.set_audio_sender(audio_sender.clone());
 
         // Connect live level meter output (mic + system) for the frontend visualizer
         pipeline.level_sender = level_sender;
@@ -1587,10 +1714,241 @@ impl Default for AudioPipelineManager {
     }
 }
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "hardware_qualification.rs"]
+mod hardware_qualification;
+
 #[cfg(test)]
 mod ring_buffer_tests {
     use super::*;
     use crate::audio::devices::DeviceType as AudioDeviceType;
+
+    #[tokio::test]
+    async fn timeline_reset_saves_both_pending_source_tails() {
+        let state = RecordingState::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (speech, _speech_rx) = mpsc::unbounded_channel();
+        let (tracks, mut tracks_rx) = mpsc::unbounded_channel();
+        let mut pipeline = AudioPipeline::new(rx, speech, state, 1000, 48_000,
+            "mic".into(), super::super::device_detection::InputDeviceKind::Unknown,
+            "system".into(), super::super::device_detection::InputDeviceKind::Unknown).unwrap();
+        pipeline.recording_sender_for_mixed = Some(tracks);
+        for (index, (source, value, timestamp)) in [
+            (DeviceType::Microphone, 0.1, 0.02),
+            (DeviceType::System, 0.2, 0.02),
+            (DeviceType::Microphone, 0.3, 5.02),
+            (DeviceType::System, 0.4, 5.02),
+        ].into_iter().enumerate() {
+            tx.send(AudioChunk { data: vec![value; 960], sample_rate: 48_000,
+                timestamp, chunk_id: index as u64, device_type: source }).unwrap();
+        }
+        drop(tx);
+        pipeline.run().await.unwrap();
+        let mut mic = Vec::new();
+        let mut sys = Vec::new();
+        while let Some(chunk) = tracks_rx.recv().await {
+            match chunk.device_type {
+                DeviceType::Microphone => mic.extend(chunk.data),
+                DeviceType::System => sys.extend(chunk.data),
+                DeviceType::Mixed => {}
+            }
+        }
+        assert_eq!(mic, [vec![0.1; 960], vec![0.3; 960]].concat());
+        assert_eq!(sys, [vec![0.2; 960], vec![0.4; 960]].concat());
+    }
+
+    #[test]
+    fn delayed_dual_sources_preserve_all_samples_over_ten_minutes() {
+        // Every block exists. Only delivery order/timing changes, with 100 ppm
+        // device-clock skew and recurrent stalls starting two minutes in.
+        // Exercise both trustworthy capture times and delivery-time backends.
+        for delayed_source in [DeviceType::Microphone, DeviceType::System] {
+            for (drift, delay) in [(0.0, 0.080), (0.0001, 0.0), (0.0001, 0.040), (0.0001, 0.320)] {
+                for capture_timestamps in [false, true] {
+                    const BLOCKS: usize = 60_000;
+                    let mut events = Vec::with_capacity(BLOCKS * 2);
+                    let mut previous_delivery = 0.0_f64;
+                    for block in 0..BLOCKS {
+                        let end = (block + 1) as f64 * 0.010;
+                        let capture_end = end * (1.0 + drift);
+                        let stall = if block >= 12_000 && block % 100 < 20 { delay } else { 0.0 };
+                        let delivery = (capture_end + stall).max(previous_delivery + 0.000_001);
+                        previous_delivery = delivery;
+                        let other = if delayed_source == DeviceType::Microphone { DeviceType::System } else { DeviceType::Microphone };
+                        events.push((end, other, block, end));
+                        events.push((delivery, delayed_source.clone(), block,
+                            if capture_timestamps { capture_end } else { delivery }));
+                    }
+                    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    let mut ring = AudioMixerRingBuffer::new(1000, true, true);
+                    let mut mic = Vec::new();
+                    let mut sys = Vec::new();
+                    for (_, source, block, timestamp) in events {
+                        // Unique nonzero block values expose drops, duplicates,
+                        // and reordering independently of any padded silence.
+                        ring.add_samples(source, vec![(block + 1) as f32; 10], timestamp);
+                        while let Some((m, s)) = ring.extract_window() {
+                            mic.extend(m);
+                            sys.extend(s);
+                        }
+                        assert!(ring.mic_buffer.len().max(ring.system_buffer.len()) < ring.max_buffer_size + ring.window_size_samples);
+                    }
+                    while let Some((m, s)) = ring.extract_remaining() {
+                        mic.extend(m);
+                        sys.extend(s);
+                    }
+                    assert_eq!(mic.len(), sys.len());
+                    for (name, track) in [("mic", &mic), ("system", &sys)] {
+                        let expected = (0..BLOCKS).flat_map(|block| std::iter::repeat((block + 1) as f32).take(10));
+                        assert!(track.iter().copied().filter(|v| *v != 0.0).eq(expected),
+                            "{name} lost/duplicated samples: delayed={delayed_source:?}, drift={drift}, delay={delay}, capture_timestamps={capture_timestamps}");
+                        if capture_timestamps {
+                            assert_eq!(track.len(), BLOCKS * 10, "capture-timed complete streams acquired silence");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_callback_is_drained_before_enforcing_the_waiting_limit() {
+        let mut ring = AudioMixerRingBuffer::new(1000, true, false);
+        let input: Vec<f32> = (1..=550).map(|value| value as f32).collect();
+        ring.add_samples(DeviceType::Microphone, input.clone(), 0.550);
+        let mut recorded = Vec::new();
+        while let Some((mic, _)) = ring.extract_window() { recorded.extend(mic); }
+        while let Some((mic, _)) = ring.extract_remaining() { recorded.extend(mic); }
+        assert_eq!(recorded, input);
+    }
+
+    #[test]
+    fn missing_source_cannot_stall_output_or_grow_the_waiting_buffer() {
+        let mut ring = AudioMixerRingBuffer::new(1000, true, true);
+        let mut recorded = Vec::new();
+        for block in 0..200 {
+            ring.add_samples(DeviceType::System, vec![2.0; 50], (block + 1) as f64 * 0.05);
+            while let Some((mic, system)) = ring.extract_window() {
+                assert!(mic.iter().all(|value| *value == 0.0));
+                recorded.extend(system);
+            }
+            assert!(ring.system_buffer.len() <= ring.max_buffer_size);
+        }
+        assert!(recorded.len() >= 10_000 - ring.max_buffer_size);
+        assert_eq!(ring.continuity.padded[0] as usize, recorded.len());
+        while let Some((_, system)) = ring.extract_remaining() { recorded.extend(system); }
+        assert_eq!(recorded, vec![2.0; 10_000]);
+        assert_eq!(ring.continuity.discarded, [0, 0]);
+    }
+
+    #[test]
+    fn callback_jitter_preserves_every_source_sample() {
+        // The reported devices deliver 10 ms (wired) and 8 ms (Bluetooth)
+        // blocks. A continuous waveform must survive their delivery jitter.
+        for block_size in [480, 384] {
+            let mut ring = AudioMixerRingBuffer::new(48_000, true, true);
+            let count = block_size * 250;
+            let microphone: Vec<f32> = (0..count).map(|i|
+                (i as f32 * std::f32::consts::TAU * 440.0 / 48_000.0).sin() * 0.4
+            ).collect();
+            let system: Vec<f32> = microphone.iter().map(|sample| -sample * 0.5).collect();
+            let mut recorded_mic = Vec::new();
+            let mut recorded_system = Vec::new();
+            for (index, (mic, sys)) in microphone.chunks(block_size).zip(system.chunks(block_size)).enumerate() {
+                let nominal_end = (index + 1) as f64 * block_size as f64 / 48_000.0;
+                let jitter = if index == 0 { 0.0 } else if index % 2 == 0 { -0.0003 } else { 0.0003 };
+                ring.add_samples(DeviceType::Microphone, mic.to_vec(), nominal_end + jitter);
+                ring.add_samples(DeviceType::System, sys.to_vec(), nominal_end - jitter);
+                while let Some((mic, sys)) = ring.extract_window() {
+                    recorded_mic.extend(mic);
+                    recorded_system.extend(sys);
+                }
+            }
+            while let Some((mic, sys)) = ring.extract_remaining() {
+                recorded_mic.extend(mic);
+                recorded_system.extend(sys);
+            }
+            assert!(recorded_mic == microphone, "microphone samples changed at {block_size}-sample callback boundaries");
+            assert!(recorded_system == system, "system samples changed at {block_size}-sample callback boundaries");
+        }
+    }
+
+    #[test]
+    fn a_real_source_gap_retains_silence_before_resuming_contiguously() {
+        let mut ring = AudioMixerRingBuffer::new(1000, true, true);
+        ring.add_samples(DeviceType::Microphone, vec![1.0; 50], 0.05);
+        ring.add_samples(DeviceType::System, vec![2.0; 50], 0.05);
+        let mut microphone = ring.extract_window().unwrap().0;
+        for end in [0.10, 0.15, 0.20, 0.25] {
+            ring.add_samples(DeviceType::System, vec![2.0; 50], end);
+            while let Some((mic, _)) = ring.extract_window() { microphone.extend(mic); }
+        }
+        // The microphone genuinely stopped for 200 ms while system continued.
+        ring.add_samples(DeviceType::Microphone, vec![3.0; 50], 0.30);
+        ring.add_samples(DeviceType::System, vec![2.0; 50], 0.30);
+        while let Some((mic, _)) = ring.extract_window() { microphone.extend(mic); }
+        ring.add_samples(DeviceType::Microphone, vec![4.0; 50], 0.351);
+        ring.add_samples(DeviceType::System, vec![2.0; 50], 0.349);
+        while let Some((mic, _)) = ring.extract_window() { microphone.extend(mic); }
+        assert_eq!(microphone, [vec![1.0; 50], vec![0.0; 200], vec![3.0; 50], vec![4.0; 50]].concat());
+    }
+
+    #[test]
+    fn short_mic_loss_does_not_silence_all_subsequent_callbacks() {
+        let mut ring = AudioMixerRingBuffer::new(1000, true, true);
+        let mut recorded = Vec::new();
+        // Lose eight 10 ms mic callbacks, below the 100 ms reanchor threshold.
+        // System audio keeps advancing, forcing a silence-padded mic window.
+        for block in 0..100 {
+            let end = (block + 1) as f64 * 0.01;
+            if !(5..13).contains(&block) {
+                ring.add_samples(DeviceType::Microphone, vec![1.0; 10], end);
+            }
+            ring.add_samples(DeviceType::System, vec![2.0; 10], end);
+            while let Some((mic, _)) = ring.extract_window() { recorded.extend(mic); }
+        }
+        while let Some((mic, _)) = ring.extract_remaining() { recorded.extend(mic); }
+        assert_eq!(recorded.len(), 1000);
+        assert_eq!(&recorded[..50], &[1.0; 50]);
+        assert_eq!(&recorded[50..130], &[0.0; 80]);
+        assert!(recorded[130..].iter().all(|sample| *sample == 1.0));
+    }
+
+    #[test]
+    fn late_queued_mic_blocks_are_not_shifted_into_current_audio() {
+        let mut ring = AudioMixerRingBuffer::new(1000, true, true);
+        ring.add_samples(DeviceType::Microphone, vec![1.0; 50], 0.05);
+        ring.add_samples(DeviceType::System, vec![2.0; 50], 0.05);
+        ring.extract_window().unwrap();
+        // Exceed the 400 ms waiting budget so the first 100 ms of missing
+        // microphone input has actually been emitted as silence.
+        for end in [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55] {
+            ring.add_samples(DeviceType::System, vec![2.0; 50], end);
+            while ring.extract_window().is_some() {}
+        }
+        // Audio from 50–100 ms arrives after silence has already been emitted.
+        ring.add_samples(DeviceType::Microphone, vec![3.0; 50], 0.10);
+        assert!(ring.mic_buffer.is_empty());
+        // Once the callback catches up, only the new interval is retained.
+        ring.add_samples(DeviceType::Microphone, vec![4.0; 50], 0.20);
+        assert_eq!(ring.mic_buffer.iter().copied().collect::<Vec<_>>(), vec![4.0; 50]);
+    }
+
+    #[test]
+    fn continuous_device_clock_drift_does_not_splice_samples() {
+        let mut ring = AudioMixerRingBuffer::new(1000, true, false);
+        let mut recorded = Vec::new();
+        let source: Vec<f32> = (0..60_000).map(|i| (i as f32 * 0.123).sin()).collect();
+        for (index, block) in source.chunks(10).enumerate() {
+            // Slowly accumulate 120 ms of clock disagreement over a minute;
+            // this is not a callback-free gap and must not cause a hard splice.
+            let end = (index + 1) as f64 * 0.010 + index as f64 * 0.000020;
+            ring.add_samples(DeviceType::Microphone, block.to_vec(), end);
+            while let Some((mic, _)) = ring.extract_window() { recorded.extend(mic); }
+        }
+        while let Some((mic, _)) = ring.extract_remaining() { recorded.extend(mic); }
+        assert!(recorded == source, "sample continuity lost to accumulated delivery-clock drift");
+    }
 
     #[test]
     fn aligns_late_source_to_recording_clock() {
@@ -1631,6 +1989,9 @@ mod ring_buffer_tests {
         let mut ring = AudioMixerRingBuffer::with_window_ms(10, true, true, 600.0);
         ring.add_samples(DeviceType::Microphone, vec![1.0; 2], 0.2);
         ring.add_samples(DeviceType::System, vec![2.0; 2], 0.2);
+        assert!(ring.needs_timeline_reset(&DeviceType::Microphone, 2, 60.2));
+        let tail = ring.extract_remaining().unwrap();
+        assert_eq!(tail, (vec![1.0; 2], vec![2.0; 2]));
         ring.add_samples(DeviceType::Microphone, vec![3.0; 2], 60.2);
 
         assert_eq!(ring.mic_buffer.len(), 2);
@@ -1705,6 +2066,41 @@ mod ring_buffer_tests {
         assert_eq!(chunk.data.len(), 1_024);
         assert!(chunk.data.iter().all(|sample| *sample == 0.0));
         assert_eq!(chunk.device_type, DeviceType::Microphone);
+    }
+
+    #[test]
+    fn delayed_capture_processing_preserves_callback_timestamp() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        let device = Arc::new(AudioDevice::new(
+            "Test microphone".to_string(),
+            AudioDeviceType::Input,
+        ));
+        let capture = AudioCapture::new(device, state, 48_000, 1, DeviceType::Microphone, None);
+        capture.process_audio_data_at(&vec![0.1; 480], 12.5, false);
+        assert_eq!(receiver.try_recv().unwrap().timestamp, 12.5);
+    }
+
+    #[test]
+    fn queued_muted_microphone_stays_silent_after_unmute() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        state.set_audio_sender(sender);
+        let device = Arc::new(AudioDevice::new("Test microphone".into(), AudioDeviceType::Input));
+        let capture = AudioCapture::new(device, state.clone(), 48_000, 1, DeviceType::Microphone, None);
+        // Prime stateful DSP with speech before a muted frame gets queued.
+        capture.process_audio_data_at(&vec![0.2; 480], 0.01, false);
+        assert!(receiver.try_recv().unwrap().data.iter().any(|value| *value != 0.0));
+        state.set_microphone_muted(true);
+        let muted_at_capture = state.is_audio_source_muted(&DeviceType::Microphone);
+        state.set_microphone_muted(false);
+        capture.process_audio_data_at(&vec![0.5; 480], 0.02, muted_at_capture);
+        let frame = receiver.try_recv().unwrap();
+        assert_eq!(frame.timestamp, 0.02);
+        assert_eq!(frame.data, vec![0.0; 480]);
     }
 
     #[test]

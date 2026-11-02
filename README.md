@@ -4,97 +4,195 @@
   <img src="frontend/src-tauri/icon-source.png" alt="Meetily - Actually Free logo" width="240" />
 </p>
 
-An entirely free, fully unlocked fork of [Meetily](https://github.com/Zackriya-Solutions/meetily). Every feature is available without an account, subscription, license key, trial, or paid tier.
+**Know who said what—during this meeting and, optionally, the next.**
 
-[Download for Windows](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/latest) · [Download for macOS Apple Silicon](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/tag/v0.2.5-macos)
+A free, local-first meeting recorder and workspace, built on
+[Meetily](https://github.com/Zackriya-Solutions/meetily). This fork unlocks the app's
+features without an account, license key, trial, or paid app tier. It puts
+speaker-aware transcripts at the center of recording, notes, and follow-up.
 
-This fork also goes beyond removing feature restrictions. It adds speaker identity, separate mic and system audio, automatic meeting detection, people profiles, richer exports, a redesigned interface, dedicated Windows and Apple Silicon installers, and numerous recording and reliability improvements.
+**What sets this fork apart**
+
+- **Speaker diarization:** see *when* different people spoke. Your microphone
+  stays labeled **You**; on-device speaker models distinguish remote voices.
+  Rename or merge speakers live or afterward, with optional Nemotron-3 for
+  live labeling and post-call refinement.
+- **Remember voices across meetings (beta):** opt in to local voice profiles,
+  explicitly teach the app a named contact's voice from a recorded meeting,
+  and get suggested names in later meetings. Matching needs clean audio and
+  can be wrong—it is not proof of someone's identity.
+- **More control, still local-first:** capture selected apps, revisit
+  speaker-colored transcripts alongside audio, and keep notes, action items,
+  and summaries in one workspace. No account or paid tier required.
+
+[Download Windows](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/latest)
+· [macOS Apple Silicon preview](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/tag/v0.2.22-macos)
+· [Release notes](https://github.com/TylerBuza/Meetily-ActuallyFree/releases)
+· [Report an issue](https://github.com/TylerBuza/Meetily-ActuallyFree/issues)
 
 ## Interface
 
+Follow a live conversation, organize your meetings, and work with transcripts,
+notes, and summaries in one workspace. Choose from three themes: **Midnight**,
+**Vanilla**, and **Charcoal**.
+
+Screenshots use demo meetings and simulated recording.
+
+### Transcript, notes, action items, and summary in one workspace
+
 <p align="center">
-  <img src="docs/images/meetily-interface.png" alt="Meetily live recording interface with speaker-labelled transcription" width="1100" />
+  <img src="docs/images/v0.2.18/meeting-detail.png" alt="Redesigned Meetily meeting workspace with speaker-colored transcript, notes, action items, and AI summary" width="1100" />
 </p>
 
-<p align="center"><sub>Live speaker-labelled transcription with synchronized source controls, shown with sanitized demo meetings.</sub></p>
+<details>
+<summary><strong>See the live recording screen and meeting library</strong></summary>
 
-## Latest Release
+### Live recording
 
-Meetily `v0.2.15` keeps meeting controls accessible in narrow panels, fixes
-disconnected-device pickers and native dark-mode controls, and adds configurable
-Claude summary output budgets with explicit truncation errors. It retains the
-Windows long-recording crash fix from v0.2.14.
-[Read the v0.2.15 changelog](CHANGELOG.md).
+<p align="center">
+  <img src="docs/images/v0.2.18/live-recording.png" alt="New live recording interface with a speaker-colored transcript, speaker panel, and compact recording controls" width="1100" />
+</p>
 
-## Feature Comparison
+### Meeting library
 
-Compared with Meetily Community `v0.4.0` and the PRO advantages advertised on its project page (verified August 2026).
+<p align="center">
+  <img src="docs/images/v0.2.18/meeting-workspace.png" alt="Meeting library with search, group and participant filters, and date-grouped recordings" width="1100" />
+</p>
 
-**Legend:** ✅ Included · ❌ Not included
+</details>
 
-| Feature | Meetily Community | Meetily PRO (Paywalled) | Meetily - Actually Free |
-| --- | :---: | :---: | :---: |
-| Live recording and local transcription | ✅ | ✅ | ✅ |
-| Local and BYOK cloud summaries | ✅ | ✅ | ✅ |
-| Create custom summary templates | ❌ | ✅ | ✅ |
-| Automatic meeting joining | ❌ | ✅ | ❌ |
-| Advanced PDF and DOCX exports | ❌ | ✅ | ✅ |
-| Separate mic and system recordings | ❌ | ❌ | ✅ |
-| Calendar integration | ❌ | ✅ | ❌ |
-| Speaker identification | ❌ | ✅ | ✅ |
-| Live mic and system audio visualizations | ❌ | ❌ | ✅ |
-| Independent mic and system mute controls | ❌ | ❌ | ✅ |
-| Automatic meeting detection | ❌ | ✅ | ✅ |
-| Floating recording controls | ❌ | ❌ | ✅ |
-| Compliance audit trails | ❌ | ✅ | ❌ |
-| Chat with meetings | ❌ | ✅ | ✅ |
-| Speaker profiles | ❌ | ❌ | ✅ |
-| Dark mode | ❌ | ❌ | ✅ |
-| Windows GPU acceleration | ❌ | ✅ | ✅ |
-| Automatic GPU setup | ❌ | ❌ | ✅ |
-| No analytics transmission or license checks | ❌ | ❌ | ✅ |
+## What you can do
 
-## Highlights
+Current source builds add YAML frontmatter and an optional Obsidian link style
+for named speakers. Other export formats keep their existing formatting.
 
-- **Speaker-aware transcripts:** mic speech stays `You`; remote voices become `Speaker N`; overlap can render as `You + Speaker 1`.
-- **Split audio pipeline:** microphone and system audio are VAD-processed and transcribed independently, while aligned source tracks are retained beside the mixed playback file.
-- **Live source visualization:** separate mic and system meters show pre-mix activity throughout recording.
-- **Floating recording bar:** shrink the main window into a compact minibar with a synchronized timer and pause, resume, stop, and restore controls.
-- **Automatic meeting detection:** watches locally for Zoom, Teams, Slack, Webex, and other meeting apps, then prompts you to start recording.
-- **Overhauled interface:** a cohesive dark-first theme across recording, transcripts, summaries, people, and settings, with light mode available.
-- **Universal Windows setup:** one installer selects NVIDIA CUDA, Vulkan, or CPU and packages required runtimes.
-- **Better post-call processing:** retranscribes retained mic/system tracks independently before diarization and summary.
-- **Meeting memory:** global search, reusable people profiles, speaker naming, and grounded person Q&A.
-- **Native exports:** PDF, DOCX, Markdown, text, JSON, or clipboard.
-- **Resilient local models:** resumable, validated downloads with Parakeet mirror fallback.
-- **Whisper vocabulary hints:** teach live and post-call transcription recurring names, acronyms, products, and meeting-specific terms.
-- **Private updates and no telemetry:** Windows update checks are opt-in, and analytics transmission is disabled on every platform.
+Local transcription, live speaker editing, organized meeting notes, flexible AI
+providers, and optional Labs features—all without a paid app tier.
 
-## Install
+<details>
+<summary><strong>Record and transcribe locally</strong></summary>
 
-### Windows
+- Capture microphone and computer audio with separate mute, volume, and level
+  controls. Keep using the workspace during a call, or shrink to the floating
+  recording bar.
+- Transcribe live with **Parakeet** or a configured transcription engine. Use
+  **Whisper** for optional post-call enhancement independently of the live model.
+- Retain microphone and system tracks alongside mixed playback audio, so
+  overlapping sources can be processed separately.
+- Refine the transcript after a call while continuing to use the meeting page;
+  progress stays in a compact, nonblocking card.
+- Watch the system-audio level and **Low audio** advisory, and adjust gain yourself.
+- Choose specific applications instead of all computer audio: Windows supports
+  a multi-app whitelist; macOS currently supports one selected application.
+- Use Whisper vocabulary hints for recurring names, acronyms, and meeting terms.
 
-1. Download `Meetily-ActuallyFree-*-universal-setup.exe` from the [latest release](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/latest).
-2. Run setup. It selects CUDA, Vulkan, or CPU automatically.
-3. Complete first-launch model setup.
+</details>
 
-Windows 10/11 x64 is supported. The installer is unsigned, so SmartScreen may
-show **Unknown publisher**.
+<details>
+<summary><strong>Follow and identify speakers</strong></summary>
 
-### macOS Apple Silicon
+- Keep microphone speech identified as **You**, with remote speakers labeled
+  separately. Rename and merge speakers during a call and edit labels afterward.
+- Choose optional **Nemotron-3** for live remote-speaker labeling and post-call
+  refinement. Nemotron uses **Auto-detect**; model speaker numbers are not a
+  person's identity.
+- Associate named speakers with contacts and see consistent person colors across
+  transcripts and meeting pages.
 
-1. Download `Meetily-Actually-Free_0.2.5_aarch64.dmg` from the [macOS release](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/tag/v0.2.5-macos).
-2. Open the DMG and drag **Meetily - Actually Free** to Applications.
+</details>
+
+<details>
+<summary><strong>Work with your meetings</strong></summary>
+
+- Read a speaker-colored, chat-style transcript and jump to audio from a line's
+  timestamp. Keep notes, action items, and the AI summary beside the conversation.
+- Organize meetings into groups, browse contacts and their meetings, and track
+  action items with owners and due dates.
+- Search meetings, transcripts, summaries, groups, people, and action items from
+  the **Ctrl+K command bar**.
+- Export one or multiple meetings to **PDF, Word, Markdown, text, or JSON**.
+- Generate useful meeting titles from summaries, with manual names taking priority.
+
+</details>
+
+<details>
+<summary><strong>Choose how AI runs</strong></summary>
+
+- Use local summary models or connect a supported provider with your own API key.
+- Use the **Claude Code CLI** summary provider with your installed `claude`
+  command and existing sign-in. External providers retain their own access and
+  billing requirements; the app adds no subscription requirement.
+- Ask questions about meetings and use custom summary templates.
+- Download optional models in the background during setup. Nemotron enables
+  after a successful download; optional Whisper is configured for post-call use.
+
+</details>
+
+<details>
+<summary><strong>Explore optional Labs features</strong></summary>
+
+Settings → **Labs** contains opt-in, experimental capabilities:
+
+- **Meeting automation:** on supported Windows meeting-detection signals,
+  automatically start and stop recordings owned by the automation.
+- **Waveform scrubbing:** navigate audio visually, with additional slower
+  playback speeds.
+- **Clean transcript:** switch between Clean and Verbatim views and use cleaned
+  text for new summaries.
+- **Whisper silence guard:** stricter silence/noise handling for Whisper.
+- **Parakeet GPU:** run the encoder through DirectML on Windows.
+- **Voice profiles (beta):** explicitly remember a named contact's voice from
+  recorded system audio for suggested names in later meetings. Opt-in matching
+  is experimental and depends on clean speech; review names before trusting them.
+
+</details>
+
+## Download and setup
+
+Windows and macOS downloads are released separately. Check each
+[release's notes](https://github.com/TylerBuza/Meetily-ActuallyFree/releases) for
+the features and platform qualifications included in that build.
+
+Windows [v0.2.23](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/tag/v0.2.23)
+includes combined-speaker display/export fixes, post-call processing improvements,
+and local crash-report timelines. See the
+[build and upgrade qualification](docs/RELEASE_V0223_QUALIFICATION.md) for verified
+preservation checks and remaining limits.
+
+<details>
+<summary><strong>Windows setup</strong></summary>
+
+1. Download `Meetily-ActuallyFree-*-universal-setup.exe` from the
+   [latest published release](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/latest).
+2. Run setup. The universal installer chooses **NVIDIA CUDA, Vulkan, or CPU** and
+   includes the required runtimes.
+3. Complete first-launch model setup and select your microphone/audio source.
+   Optional downloads can continue in the background; recording needs a ready
+   transcription model.
+
+Windows 10/11 x64 is supported. Windows installers are not Authenticode-signed,
+so SmartScreen may show **Unknown publisher**. Release downloads include SHA-256
+checksums; the Windows updater payload has a separate cryptographic signature.
+
+</details>
+
+<details>
+<summary><strong>macOS Apple Silicon preview setup</strong></summary>
+
+1. Download the Apple Silicon `.dmg` from the
+[macOS release](https://github.com/TylerBuza/Meetily-ActuallyFree/releases/tag/v0.2.22-macos).
+2. Open the DMG and drag **Meetily - Actually Free** into Applications.
 3. Grant microphone and Audio Capture permissions when prompted.
 
-M1 and newer Macs running macOS 14.2 Sonoma or later are supported. The DMG is not Apple-notarized, so first launch may require Control-clicking the app and selecting **Open**. Both releases include SHA-256 checksums.
+Requires an **M1 or newer Mac running macOS 14.2 Sonoma or later**. The DMG is
+not notarized; first launch may require **Privacy & Security → Open Anyway**. This separate
+preview passed automated packaging/launch checks, with physical macOS capture
+qualification still pending. See the [macOS release runbook](.github/workflows/MACOS_RELEASE.md).
 
-The current macOS 0.2.5 artifact passed automated Apple Silicon packaging and
-launch checks, but physical macOS 14.2 capture qualification is still pending.
-Treat it as a preview and verify recordings before relying on it for critical
-meetings.
+</details>
 
-### Linux
+<details>
+<summary><strong>Linux setup (build from source)</strong></summary>
 
 There is no prebuilt Linux release yet — build the AppImage yourself:
 
@@ -107,42 +205,62 @@ export TAURI_GPU_FEATURE=hipblas   # or cuda / vulkan / none; omit to auto-detec
 
 The AppImage is written to `target/release/bundle/appimage/`. Make it
 executable and run it directly (`chmod +x`, then double-click or run from a
-terminal) — no system install step is required. See [Build](#build) below for
-requirements and other GPU backends.
+terminal) — no system install step is required. See the Linux notes under
+[Build and contribute](#build-and-contribute) for requirements.
 
 There is no in-app update check on Linux; rebuild and replace the AppImage to
-update, or just run:
+update, or run:
 
 ```bash
 cd frontend
 ./update-linux.sh
 ```
 
-This pulls the latest source, rebuilds, and atomically replaces the installed
+This pulls the current branch, rebuilds, and atomically replaces the installed
 AppImage (default `~/Applications/Meetily-ActuallyFree.AppImage`; override
 with `INSTALL_DIR`/`INSTALL_NAME`). It refuses to run over uncommitted local
 changes.
 
-## Local Data
+</details>
+
+## Your data and model choices
+
+Recordings, the meeting database, and downloaded models are stored locally.
+Local inference can run without sending meeting content to a cloud model;
+choosing a cloud provider or Claude CLI changes where that provider processes
+the content. Model downloads and optional update checks require network access.
+Analytics transmission is disabled, and Windows update checks are opt-in.
+
+<details>
+<summary><strong>Storage locations and saved audio files</strong></summary>
 
 | Data | Location |
 | --- | --- |
-| Database, templates, and models | Windows/Linux: install-local when writable; macOS: `~/Library/Application Support/Meetily` |
-| Recording/onboarding preference stores | macOS: `~/Library/Application Support/com.meetily.ai` |
-| Recordings | Windows: `Music/meetily-recordings`; macOS: `Movies/meetily-recordings`; configurable in Settings |
-| Playback and retained tracks | `audio.mp4`, `mic.mp4`, `system.mp4` |
+| Database, templates, and models | Windows/Linux: `<app folder>/data` when writable, with an OS data-directory fallback; macOS: `~/Library/Application Support/Meetily` |
+| Recording/onboarding preferences | Tauri's application-data store; macOS: `~/Library/Application Support/com.meetily.ai` |
+| Default recordings folder | Windows: `Music/meetily-recordings`; macOS: `Movies/meetily-recordings` |
+| Saved audio tracks | `audio.mp4` (mixed playback), `mic.mp4`, and `system.mp4` |
 
-Use **Settings → General → Data Storage Locations** or **Settings → Recording →
-Save Location** to choose another writable recordings folder.
-Meetily validates the destination before saving it and keeps core app data in
-the platform-specific location above.
+Change the recordings folder in **Settings → Recording → Save Location**.
+The meeting database, models, and preferences are distinct from the audio folder;
+copying recordings alone does not move the entire workspace.
 
-## Build
+</details>
+
+## Build and contribute
+
+Start with the [development map](docs/DEVELOPMENT_MAP.md),
+[architecture notes](ARCHITECTURE.md), and [contributor conventions](AGENTS.md).
 
 <details>
-<summary>Build instructions</summary>
+<summary><strong>Build commands</strong></summary>
 
-Windows requirements: Rust, Node.js, pnpm, Visual Studio 2022 Build Tools with C++, CMake, and Git.
+The desktop app uses **React/Next.js** in a **Tauri 2** WebView. **Rust** owns
+capture, transcription, diarization, local storage, and AI orchestration. No
+separate application server is required.
+
+Windows prerequisites: Rust, Node.js/pnpm, Visual Studio 2022 Build Tools with
+C++, CMake, and LLVM/libclang. GPU builds also need the corresponding SDK/toolkit.
 
 ```powershell
 cd frontend
@@ -150,14 +268,21 @@ pnpm install
 pnpm run tauri:dev:cpu
 ```
 
-Universal release build:
+Universal Windows packaging:
 
 ```powershell
 cd frontend
 .\scripts\build-universal-windows.ps1 -AllowUnsigned
 ```
 
-Apple Silicon DMG build on macOS 14.2 or later:
+Validate the resulting Windows package from the repository root:
+
+```powershell
+node frontend/scripts/verify-windows-release.mjs
+```
+
+Apple Silicon builds must run on macOS with Rust, Node.js/pnpm, and Xcode command
+line tools:
 
 ```bash
 cd frontend
@@ -170,6 +295,17 @@ Linux requirements: Rust, Node.js (npm or pnpm), CMake, and clang/libclang
 install the vendor SDK first: CUDA Toolkit for NVIDIA, ROCm for AMD, or the
 Vulkan SDK.
 
+The AppImage bundles GStreamer so the meeting page can play recordings, which
+also needs `patchelf` and the GStreamer plugins to copy in: base, good
+(`qtdemux`, `autoaudiosink`) and libav (AAC). On Arch/CachyOS:
+
+```bash
+sudo pacman -S --needed patchelf gst-plugins-base gst-plugins-good gst-libav
+```
+
+Without them the build fails at `failed to run linuxdeploy`, or, if an AppImage
+is built without plugins, opening a meeting crashes WebKit and freezes the app.
+
 ```bash
 cd frontend
 npm install
@@ -177,25 +313,12 @@ export TAURI_GPU_FEATURE=none   # dev mode; drop this line to auto-detect a GPU 
 ./dev-gpu.sh
 ```
 
-GPU-accelerated release build producing an AppImage:
-
-```bash
-cd frontend
-export TAURI_GPU_FEATURE=hipblas   # or cuda / vulkan / none
-./build-gpu.sh
-```
-
-`TAURI_GPU_FEATURE` accepts `cuda`, `hipblas` (AMD ROCm), `vulkan`, or `none`;
-leave it unset to auto-detect from installed drivers.
-
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for implementation details and the
-[`macOS release runbook`](.github/workflows/MACOS_RELEASE.md) for the native
-candidate, publication, and physical-device checks.
-
 </details>
 
-## Credits And License
+## Credits and license
 
-Maintained by [Tyler Buza](https://buza.dev). Based on the original [Meetily](https://github.com/Zackriya-Solutions/meetily) project by Zackriya Solutions.
+Maintained by **[Tyler Buza (@TylerBuza)](https://github.com/TylerBuza)**, based on the original
+[Meetily](https://github.com/Zackriya-Solutions/meetily) project by Zackriya Solutions.
 
-MIT licensed. See [`LICENSE.md`](LICENSE.md). Original copyright notices and license terms are retained.
+MIT licensed. See [LICENSE.md](LICENSE.md). Original copyright notices and license
+terms are retained.

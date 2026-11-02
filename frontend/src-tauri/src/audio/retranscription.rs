@@ -24,6 +24,9 @@ static RETRANSCRIPTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to signal cancellation
 static RETRANSCRIPTION_CANCELLED: AtomicBool = AtomicBool::new(false);
+// Serialize cancellation with ownership changes so a stale UI cannot cancel
+// the next meeting's retranscription after its own job has finished.
+static RETRANSCRIPTION_MEETING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// RAII guard for RETRANSCRIPTION_IN_PROGRESS flag
 /// Ensures flag is cleared even if retranscription panics or returns early
@@ -31,19 +34,24 @@ struct RetranscriptionGuard;
 
 impl RetranscriptionGuard {
     /// Create guard and set flag atomically
-    fn acquire() -> Result<Self, String> {
+    fn acquire(meeting_id: &str) -> Result<Self, String> {
+        let mut owner = RETRANSCRIPTION_MEETING.lock().unwrap();
         if RETRANSCRIPTION_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err("Retranscription already in progress".to_string());
         }
+        *owner = Some(meeting_id.to_owned());
+        RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
         Ok(RetranscriptionGuard)
     }
 }
 
 impl Drop for RetranscriptionGuard {
     fn drop(&mut self) {
+        let mut owner = RETRANSCRIPTION_MEETING.lock().unwrap();
+        *owner = None;
         RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 }
@@ -98,7 +106,7 @@ async fn start_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
-    initial_prompt: Option<String>,
+    vocabulary: Option<String>,
 ) -> Result<RetranscriptionResult> {
     let use_parakeet = provider.as_deref() == Some("parakeet");
     let batch_lease = super::common::acquire_stt_batch_lease().await;
@@ -109,7 +117,7 @@ async fn start_retranscription<R: Runtime>(
         language,
         model,
         provider,
-        initial_prompt,
+        vocabulary,
     )
     .await;
     drop(batch_lease);
@@ -220,6 +228,22 @@ fn find_retranscription_sources(folder: &Path, fallback: &Path) -> Vec<Retranscr
     sources
 }
 
+fn is_manual_speaker_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let is_generated = trimmed.split(" + ").all(|part| {
+        let p = part.trim();
+        p.eq_ignore_ascii_case("guest")
+            || p.eq_ignore_ascii_case("you")
+            || p.eq_ignore_ascii_case("unknown")
+            || (p.to_ascii_lowercase().starts_with("speaker ")
+                && p[8..].trim().chars().all(|c| c.is_ascii_digit()))
+    });
+    !is_generated
+}
+
 fn create_source_labeled_segments(
     transcripts: &[(String, f64, f64)],
     speaker_hints: &[Option<&str>],
@@ -241,7 +265,7 @@ async fn run_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
-    initial_prompt: Option<String>,
+    vocabulary: Option<String>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
@@ -450,11 +474,20 @@ async fn run_retranscription<R: Runtime>(
             continue;
         }
 
+        // Skip silent segments (RMS < 0.005 and peak < 0.01) to prevent Whisper silence hallucinations (e.g. "you", "thank you")
+        let sum_sq: f32 = segment.samples.iter().map(|&x| x * x).sum();
+        let rms = (sum_sq / segment.samples.len() as f32).sqrt();
+        let peak = segment.samples.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        if rms < 0.005 && peak < 0.01 {
+            debug!("Skipping silent segment {} with RMS {:.5}, peak {:.5}", i, rms, peak);
+            continue;
+        }
+
         // Transcribe this segment
         let (text, conf) = if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
             let text = engine
-                .transcribe_audio(segment.samples.clone())
+                .transcribe_audio(segment.samples.clone(), vocabulary.as_deref())
                 .await
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
             (text, 0.9f32)
@@ -464,7 +497,7 @@ async fn run_retranscription<R: Runtime>(
                 .transcribe_audio_with_confidence(
                     segment.samples.clone(),
                     language.clone(),
-                    initial_prompt.as_deref(),
+                    vocabulary.as_deref(),
                 )
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
@@ -474,6 +507,14 @@ async fn run_retranscription<R: Runtime>(
         // Skip empty transcripts
         let trimmed = text.trim();
         if !trimmed.is_empty() {
+            // Filter out known Whisper silence hallucinations if energy is low
+            let lower = trimmed.to_lowercase();
+            let is_hallucination = (lower == "you" || lower == "you." || lower == "thank you." || lower == "thank you" || lower == "thanks." || lower == "bye." || lower == "bye") && rms < 0.02;
+            if is_hallucination {
+                warn!("Dropping suspected silence hallucination on segment {}: '{}' (rms={:.5}, conf={:.2})", i + 1, trimmed, rms, conf);
+                continue;
+            }
+
             debug!(
                 "Segment {}/{}: {:.1}s, conf={:.2}, text='{}'",
                 i + 1, processable_count, segment_duration_sec, conf,
@@ -522,9 +563,71 @@ async fn run_retranscription<R: Runtime>(
     let recording_started_at = crate::api::recording_started_at_from_folder(&meeting_folder_path)
         .unwrap_or(stored_recording_start.0);
 
+    // Load existing transcripts before deleting them to preserve any manually assigned speaker names
+    let existing_transcripts: Vec<(Option<f64>, Option<f64>, Option<String>)> = sqlx::query_as(
+        "SELECT audio_start_time, audio_end_time, speaker FROM transcripts WHERE meeting_id = ? ORDER BY audio_start_time ASC",
+    )
+    .bind(&meeting_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let manual_ranges: Vec<(f64, f64, String)> = existing_transcripts
+        .into_iter()
+        .filter_map(|(s_opt, e_opt, spk_opt)| {
+            let spk = spk_opt?;
+            if is_manual_speaker_label(&spk) {
+                let s = s_opt?;
+                let e = e_opt?;
+                if e > s {
+                    Some((s, e, spk))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Reconstructed timestamps must remain stable across repeated runs.
-    let segments =
+    let mut segments =
         create_source_labeled_segments(&all_transcripts, &speaker_hints, recording_started_at)?;
+
+    if !manual_ranges.is_empty() {
+        for segment in &mut segments {
+            // Keep mic audio deterministically as "You"
+            let is_mic = segment
+                .speaker
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("you"))
+                .unwrap_or(false);
+            if is_mic {
+                continue;
+            }
+            if let (Some(seg_start), Some(seg_end)) =
+                (segment.audio_start_time, segment.audio_end_time)
+            {
+                if seg_end <= seg_start {
+                    continue;
+                }
+                let mut best_name: Option<String> = None;
+                let mut best_overlap: f64 = 0.0;
+                for (ms, me, name) in &manual_ranges {
+                    let overlap = (seg_end.min(*me) - seg_start.max(*ms)).max(0.0);
+                    if overlap > best_overlap {
+                        best_overlap = overlap;
+                        best_name = Some(name.clone());
+                    }
+                }
+                if let Some(name) = best_name {
+                    if best_overlap > 0.05 {
+                        segment.speaker = Some(name);
+                    }
+                }
+            }
+        }
+    }
 
     let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
     let mut tx = sqlx::Connection::begin(&mut *conn)
@@ -539,13 +642,6 @@ async fn run_retranscription<R: Runtime>(
             .await
             .map_err(|e| anyhow!("Failed to repair meeting recording start: {}", e))?;
     }
-
-    crate::database::repositories::person::clear_meeting_speaker_mappings(
-        &mut tx,
-        &meeting_id,
-    )
-    .await
-    .map_err(|e| anyhow!("Failed to clear person speaker mappings: {}", e))?;
 
     sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
         .bind(&meeting_id)
@@ -851,6 +947,7 @@ fn write_retranscription_metadata(
         let existing = std::fs::read_to_string(&metadata_path)?;
         let mut value: serde_json::Value = serde_json::from_str(&existing)?;
         if let Some(obj) = value.as_object_mut() {
+            obj.insert("duration_seconds".to_string(), serde_json::json!(duration_seconds));
             obj.insert("retranscribed_at".to_string(), serde_json::json!(now));
             obj.insert("status".to_string(), serde_json::json!("completed"));
             obj.insert("transcript_file".to_string(), serde_json::json!("transcripts.json"));
@@ -904,41 +1001,29 @@ pub async fn start_retranscription_command<R: Runtime>(
 
     // Reserve before returning so duplicate requests and cancellation also see
     // jobs queued behind an offline diarization pass.
-    let guard = RetranscriptionGuard::acquire()?;
-    RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+    let guard = RetranscriptionGuard::acquire(&meeting_id)?;
 
-    let use_parakeet = provider.as_deref() == Some("parakeet");
-    let initial_prompt = if use_parakeet {
-        if vocabulary_terms
-            .as_deref()
-            .is_some_and(|terms| !terms.trim().is_empty())
-        {
-            return Err("Vocabulary hints are only supported by Whisper".to_string());
-        }
-        None
-    } else {
-        let state = app
-            .try_state::<AppState>()
-            .ok_or_else(|| "Database not initialized".to_string())?;
-        let pool = state.db_manager.pool();
-        if let Some(terms) = vocabulary_terms
-            .as_deref()
-            .filter(|terms| !terms.trim().is_empty())
-        {
-            match vocabulary_scope.as_deref().unwrap_or("meeting") {
-                "meeting" => {
-                    VocabularyRepository::add_meeting(pool, &meeting_id, terms).await?;
-                }
-                "global" => {
-                    VocabularyRepository::add_global(pool, terms).await?;
-                }
-                _ => return Err("Invalid vocabulary scope".to_string()),
+    let state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| "Database not initialized".to_string())?;
+    let pool = state.db_manager.pool();
+    if let Some(terms) = vocabulary_terms
+        .as_deref()
+        .filter(|terms| !terms.trim().is_empty())
+    {
+        match vocabulary_scope.as_deref().unwrap_or("meeting") {
+            "meeting" => {
+                VocabularyRepository::add_meeting(pool, &meeting_id, terms).await?;
             }
+            "global" => {
+                VocabularyRepository::add_global(pool, terms).await?;
+            }
+            _ => return Err("Invalid vocabulary scope".to_string()),
         }
-        VocabularyRepository::get_effective(pool, Some(&meeting_id))
-            .await
-            .map_err(|error| error.to_string())?
-    };
+    }
+    let vocabulary = VocabularyRepository::get_effective(pool, Some(&meeting_id))
+        .await
+        .map_err(|error| error.to_string())?;
 
     // Clone values for the spawned task
     let meeting_id_clone = meeting_id.clone();
@@ -954,7 +1039,7 @@ pub async fn start_retranscription_command<R: Runtime>(
             language,
             model,
             provider,
-            initial_prompt,
+            vocabulary,
         )
         .await;
 
@@ -972,7 +1057,13 @@ pub async fn start_retranscription_command<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn cancel_retranscription_command() -> Result<(), String> {
+pub async fn cancel_retranscription_command(meeting_id: Option<String>) -> Result<(), String> {
+    let owner = RETRANSCRIPTION_MEETING.lock().unwrap();
+    if let Some(expected) = meeting_id.as_deref() {
+        if owner.as_deref() != Some(expected) {
+            return Err("This meeting has no active retranscription".into());
+        }
+    }
     if !is_retranscription_in_progress() {
         return Err("No retranscription in progress".to_string());
     }
@@ -981,13 +1072,45 @@ pub async fn cancel_retranscription_command() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn is_retranscription_in_progress_command() -> bool {
-    is_retranscription_in_progress()
+pub async fn is_retranscription_in_progress_command(meeting_id: Option<String>) -> bool {
+    match meeting_id {
+        Some(expected) => RETRANSCRIPTION_MEETING.lock().unwrap().as_deref() == Some(expected.as_str()),
+        None => is_retranscription_in_progress(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stale_meeting_cancellation_cannot_cancel_another_job() {
+        let guard = super::RetranscriptionGuard::acquire("meeting-b").unwrap();
+        assert!(super::cancel_retranscription_command(Some("meeting-a".into())).await.is_err());
+        assert!(!super::RETRANSCRIPTION_CANCELLED.load(std::sync::atomic::Ordering::SeqCst));
+        super::cancel_retranscription_command(Some("meeting-b".into())).await.unwrap();
+        assert!(super::RETRANSCRIPTION_CANCELLED.load(std::sync::atomic::Ordering::SeqCst));
+        drop(guard);
+        assert!(super::RETRANSCRIPTION_MEETING.lock().unwrap().is_none());
+        super::RETRANSCRIPTION_CANCELLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     use super::*;
+
+    #[test]
+    fn retranscription_repairs_duration_and_preserves_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.json");
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
+            "meeting_id":"original", "duration_seconds":2.5,
+            "audio_file":"voice.m4a", "summary_language":"fr",
+            "detected_summary_language":"en", "custom_field":"keep"
+        })).unwrap()).unwrap();
+        write_retranscription_metadata(dir.path(), "ignored", 5.16, "voice.m4a").unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(result["duration_seconds"], 5.16);
+        assert_eq!(result["meeting_id"], "original");
+        assert_eq!(result["summary_language"], "fr");
+        assert_eq!(result["custom_field"], "keep");
+        assert!(result.get("detected_summary_language").is_none());
+    }
 
     fn test_recording_start() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")
