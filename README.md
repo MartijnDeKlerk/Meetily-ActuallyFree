@@ -295,6 +295,17 @@ Linux requirements: Rust, Node.js (npm or pnpm), CMake, and clang/libclang
 install the vendor SDK first: CUDA Toolkit for NVIDIA, ROCm for AMD, or the
 Vulkan SDK.
 
+The AppImage bundles GStreamer so the meeting page can play recordings, which
+also needs `patchelf` and the GStreamer plugins to copy in: base, good
+(`qtdemux`, `autoaudiosink`) and libav (AAC). On Arch/CachyOS:
+
+```bash
+sudo pacman -S --needed patchelf gst-plugins-base gst-plugins-good gst-libav
+```
+
+Without them the build fails at `failed to run linuxdeploy`, or, if an AppImage
+is built without plugins, opening a meeting crashes WebKit and freezes the app.
+
 ```bash
 cd frontend
 npm install
