@@ -70,27 +70,42 @@ function normalizePreference(value: string | null): ThemePreference {
  * The OS color scheme as reported by the native side (XDG Settings portal on
  * Linux). WebKitGTK's `prefers-color-scheme` does not follow KDE's setting, so
  * this wins when known; `null` means fall back to the media query. The last
- * value is cached so the boot script can paint correctly before IPC answers.
+ * value is cached and used provisionally from startup, matching the boot
+ * script's first paint, until the native read replaces it.
  */
 const SYSTEM_DARK_STORAGE_KEY = 'meetily_system_dark';
-let nativeSystemDark: boolean | null = null;
+let nativeSystemDark: boolean | null | undefined;
 
 function systemPrefersDark(): boolean {
   if (typeof window === 'undefined') return false;
+  if (nativeSystemDark === undefined) {
+    try {
+      const cached = localStorage.getItem(SYSTEM_DARK_STORAGE_KEY);
+      nativeSystemDark = cached === null ? null : cached === '1';
+    } catch {
+      nativeSystemDark = null;
+    }
+  }
   if (nativeSystemDark !== null) return nativeSystemDark;
   return window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
-function setNativeSystemDark(dark: boolean) {
+/** `null` = the OS has no preference: drop the override and the cache. */
+function setNativeSystemDark(dark: boolean | null) {
   nativeSystemDark = dark;
   try {
-    localStorage.setItem(SYSTEM_DARK_STORAGE_KEY, dark ? '1' : '0');
+    if (dark === null) localStorage.removeItem(SYSTEM_DARK_STORAGE_KEY);
+    else localStorage.setItem(SYSTEM_DARK_STORAGE_KEY, dark ? '1' : '0');
   } catch {
     // Cache only; the live value above still applies.
   }
 }
 
-/** Read the native OS scheme once and follow its changes. Returns an unsubscribe. */
+function schemeToDark(scheme: string | null): boolean | null {
+  return scheme === 'dark' ? true : scheme === 'light' ? false : null;
+}
+
+/** Follow the native OS scheme. Returns an unsubscribe. */
 function watchNativeSystemScheme(onChange: () => void): () => void {
   if (!('__TAURI_INTERNALS__' in window)) return () => {};
   let cancelled = false;
@@ -101,18 +116,23 @@ function watchNativeSystemScheme(onChange: () => void): () => void {
         import('@tauri-apps/api/core'),
         import('@tauri-apps/api/event'),
       ]);
-      const initial = await invoke<'dark' | 'light' | null>('get_system_color_scheme');
-      if (cancelled) return;
-      if (initial) {
-        setNativeSystemDark(initial === 'dark');
-        onChange();
-      }
-      const stop = await listen<'dark' | 'light'>('system-color-scheme-changed', (event) => {
-        setNativeSystemDark(event.payload === 'dark');
+      // Subscribe before reading, so a change during the read is not lost; an
+      // event that arrives first is newer than the snapshot and wins over it.
+      let eventSeen = false;
+      const stop = await listen<string>('system-color-scheme-changed', (event) => {
+        eventSeen = true;
+        setNativeSystemDark(schemeToDark(event.payload));
         onChange();
       });
-      if (cancelled) stop();
-      else unlisten = stop;
+      if (cancelled) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      const initial = await invoke<string | null>('get_system_color_scheme');
+      if (cancelled || eventSeen || initial === null) return;
+      setNativeSystemDark(schemeToDark(initial));
+      onChange();
     } catch (error) {
       console.warn('Native color scheme unavailable; using prefers-color-scheme:', error);
     }
@@ -129,6 +149,22 @@ function savedDarkTheme(): AppTheme {
     return themeInfo(saved).dark ? saved : DEFAULT_THEME;
   } catch {
     return DEFAULT_THEME;
+  }
+}
+
+/**
+ * Keep the fixed dark theme the user is on before "system" replaces it, so
+ * switching to system and back (or upgrading with Charcoal selected) does not
+ * lose it. Must run before the system preference is resolved or persisted.
+ */
+function rememberFixedDarkTheme() {
+  try {
+    const current = localStorage.getItem(THEME_STORAGE_KEY);
+    if (current === 'midnight' || current === 'charcoal') {
+      localStorage.setItem(DARK_THEME_STORAGE_KEY, current);
+    }
+  } catch {
+    // Falls back to the default dark theme.
   }
 }
 
@@ -256,7 +292,10 @@ export function useThemePreference(): [ThemePreference, (preference: ThemePrefer
 
   return [
     preference,
-    (next: ThemePreference) => applyAppTheme(resolveThemePreference(next), true, next),
+    (next: ThemePreference) => {
+      if (next === 'system') rememberFixedDarkTheme();
+      applyAppTheme(resolveThemePreference(next), true, next);
+    },
   ];
 }
 

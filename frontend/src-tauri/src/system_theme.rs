@@ -10,7 +10,8 @@ use tauri::AppHandle;
 
 pub const SYSTEM_COLOR_SCHEME_EVENT: &str = "system-color-scheme-changed";
 
-/// "dark", "light", or `None` when the OS gives no preference.
+/// "dark", "light", or "none" when the OS expresses no preference; `None` when
+/// the OS cannot be asked at all.
 #[tauri::command]
 pub async fn get_system_color_scheme() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -23,7 +24,7 @@ pub async fn get_system_color_scheme() -> Option<String> {
     }
 }
 
-/// Emit `system-color-scheme-changed` (payload "dark"/"light") on OS changes.
+/// Emit `system-color-scheme-changed` (payload "dark", "light" or "none") on OS changes.
 pub fn watch(_app: &AppHandle) {
     #[cfg(target_os = "linux")]
     {
@@ -43,11 +44,11 @@ mod linux {
     const KEY: &str = "color-scheme";
 
     /// Portal values: 0 = no preference, 1 = prefer dark, 2 = prefer light.
-    fn label(value: u32) -> Option<String> {
+    fn label(value: u32) -> &'static str {
         match value {
-            1 => Some("dark".into()),
-            2 => Some("light".into()),
-            _ => None,
+            1 => "dark",
+            2 => "light",
+            _ => "none",
         }
     }
 
@@ -65,7 +66,7 @@ mod linux {
         let conn = zbus::Connection::session().await.ok()?;
         let proxy = proxy(&conn).await.ok()?;
         let value: OwnedValue = proxy.call("ReadOne", &(NAMESPACE, KEY)).await.ok()?;
-        label(u32::try_from(value).ok()?)
+        Some(label(u32::try_from(value).ok()?).to_string())
     }
 
     pub async fn watch(app: AppHandle) {
@@ -82,9 +83,10 @@ mod linux {
                 if namespace != NAMESPACE || key != KEY {
                     continue;
                 }
-                // "No preference" is not a change the frontend can act on.
-                if let Some(scheme) = u32::try_from(value).ok().and_then(label) {
-                    let _ = app.emit(SYSTEM_COLOR_SCHEME_EVENT, scheme);
+                // "none" is forwarded too: the frontend must drop a stale dark/light
+                // override and fall back to prefers-color-scheme.
+                if let Ok(value) = u32::try_from(value) {
+                    let _ = app.emit(SYSTEM_COLOR_SCHEME_EVENT, label(value));
                 }
             }
             Ok(())
