@@ -111,14 +111,14 @@ function watchNativeSystemScheme(onChange: () => void): () => void {
   let cancelled = false;
   let unlisten: (() => void) | undefined;
   void (async () => {
+    // An event that arrives before the initial read is newer than that read.
+    let eventSeen = false;
     try {
       const [{ invoke }, { listen }] = await Promise.all([
         import('@tauri-apps/api/core'),
         import('@tauri-apps/api/event'),
       ]);
-      // Subscribe before reading, so a change during the read is not lost; an
-      // event that arrives first is newer than the snapshot and wins over it.
-      let eventSeen = false;
+      // Subscribe before reading, so a change during the read is not lost.
       const stop = await listen<string>('system-color-scheme-changed', (event) => {
         eventSeen = true;
         setNativeSystemDark(schemeToDark(event.payload));
@@ -130,11 +130,17 @@ function watchNativeSystemScheme(onChange: () => void): () => void {
       }
       unlisten = stop;
       const initial = await invoke<string | null>('get_system_color_scheme');
-      if (cancelled || eventSeen || initial === null) return;
+      if (cancelled || eventSeen) return;
+      // `null` (portal unavailable) clears a scheme cached by an earlier run, so
+      // a stale override cannot outlive the desktop that produced it.
       setNativeSystemDark(schemeToDark(initial));
       onChange();
     } catch (error) {
       console.warn('Native color scheme unavailable; using prefers-color-scheme:', error);
+      if (!cancelled && !eventSeen) {
+        setNativeSystemDark(null);
+        onChange();
+      }
     }
   })();
   return () => {
