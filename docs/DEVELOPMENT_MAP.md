@@ -276,6 +276,24 @@ verifier requires `notes` to be a string. This was caught during v0.2.18 draft
 preparation; the manifest/checksums were regenerated and reverified without
 changing the signed executable payloads.
 
+## Appearance
+
+`frontend/src/lib/app-theme.ts` owns theme state. The stored preference
+(`meetily_theme`) is a fixed theme or `system`. In `system` mode the app resolves
+the OS scheme to Vanilla (light) or the last dark theme picked
+(`meetily_theme_dark`) and repaints on OS changes.
+
+The OS scheme comes from `src-tauri/src/system_theme.rs`: on Linux it reads the
+XDG Settings portal (`org.freedesktop.appearance color-scheme`) with `zbus`,
+returns it through `get_system_color_scheme`, and emits
+`system-color-scheme-changed` on changes. This is needed because WebKitGTK's
+`prefers-color-scheme` does not follow KDE's setting. Other platforms return
+`None` and the frontend falls back to `prefers-color-scheme`. The last scheme is
+cached in `meetily_system_dark` so the boot script paints correctly.
+
+Tested: manually on KDE Plasma (follows live switches). Not tested: GNOME,
+macOS, Windows, or automated tests.
+
 ## 6. Tests, qualification, and historical notes
 
 Crash diagnostics are mapped in [ARCHITECTURE.md](../ARCHITECTURE.md#crash-reports).

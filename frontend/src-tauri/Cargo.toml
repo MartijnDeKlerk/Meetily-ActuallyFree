@@ -223,6 +223,8 @@ futures-channel = "0.3.31"
 #   --features hipblas  (AMD ROCm)
 #   --features openblas (OpenBLAS optimization, requires BLAS_INCLUDE_DIRS)
 [target.'cfg(target_os = "linux")'.dependencies]
+# Already in the tree via tauri; used to read the XDG Settings portal.
+zbus = "5"
 whisper-rs = { version = "0.16", features = ["raw-api"] }
 futures-channel = "0.3.31"
 

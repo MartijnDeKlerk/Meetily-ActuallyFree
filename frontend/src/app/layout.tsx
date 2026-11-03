@@ -14,7 +14,7 @@ import { usePathname, useRouter } from 'next/navigation'
 import { launchRecording, requestRecordingStop } from '@/lib/recording-launch'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
-import { applyAppTheme, getSavedAppTheme, themeInfo, THEME_BOOT_SCRIPT, useAppTheme } from '@/lib/app-theme'
+import { applyAppTheme, getSavedAppTheme, getSavedThemePreference, themeInfo, THEME_BOOT_SCRIPT, useAppTheme, useThemePreference } from '@/lib/app-theme'
 import { COMPACT_MIN_WIDTH } from '@/hooks/useCompactChrome'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { AppTooltipGuard } from '@/components/AppTooltipGuard'
@@ -171,8 +171,10 @@ export default function RootLayout({
   // native title bar. useAppTheme follows changes from Settings and from the
   // other window.
   const [appTheme] = useAppTheme()
+  // Also owns the listener that repaints when the OS switches light/dark.
+  useThemePreference()
   useEffect(() => {
-    applyAppTheme(getSavedAppTheme())
+    applyAppTheme(getSavedAppTheme(), false, getSavedThemePreference())
   }, [])
 
   // Keep the window wide enough for the expanded rail, its collapse control,
