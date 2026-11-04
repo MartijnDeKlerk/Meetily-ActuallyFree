@@ -2,7 +2,7 @@
 
 import { Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { THEMES, useAppTheme, type ThemeInfo } from '@/lib/app-theme';
+import { THEMES, getSavedAppTheme, useThemePreference, type ThemeInfo } from '@/lib/app-theme';
 
 /** A tiny rendition of the app in the theme's own colors. */
 function ThemePreview({ theme }: { theme: ThemeInfo }) {
@@ -29,12 +29,28 @@ function ThemePreview({ theme }: { theme: ThemeInfo }) {
 }
 
 export function ThemePicker() {
-  const [current, setTheme] = useAppTheme();
+  const [current, setTheme] = useThemePreference();
+  const following = current === 'system';
 
   return (
+    <div className="space-y-3">
+      <label className="flex cursor-pointer items-center gap-2.5 text-sm text-af-text">
+        <input
+          type="checkbox"
+          checked={following}
+          onChange={(event) => setTheme(event.target.checked ? 'system' : getSavedAppTheme())}
+          className="h-4 w-4 accent-[rgb(var(--af-accent-rgb))]"
+        />
+        <span>
+          Match system appearance
+          <span className="block text-xs text-af-text-3">
+            Vanilla in light mode; your last dark theme in dark mode.
+          </span>
+        </span>
+      </label>
     <div role="radiogroup" aria-label="Theme" className="grid gap-3 sm:grid-cols-3">
       {THEMES.map((theme) => {
-        const selected = theme.id === current;
+        const selected = !following && theme.id === current;
         return (
           <button
             key={theme.id}
@@ -68,6 +84,7 @@ export function ThemePicker() {
           </button>
         );
       })}
+    </div>
     </div>
   );
 }

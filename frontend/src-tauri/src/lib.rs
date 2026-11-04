@@ -46,6 +46,7 @@ pub mod database;
 pub mod diarization;
 mod optional_models;
 pub mod notifications;
+pub mod system_theme;
 pub mod ollama;
 pub mod onboarding;
 pub mod onnx_runtime;
@@ -491,6 +492,7 @@ pub fn run() {
             if let Err(error) = crash_report::start_session() {
                 log::error!("Failed to initialize crash reporting: {error}");
             }
+            system_theme::watch(_app.handle());
             #[cfg(windows)]
             onnx_runtime::initialize(_app.handle());
             log::info!("Application setup complete");
@@ -637,6 +639,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            system_theme::get_system_color_scheme,
             start_recording,
             stop_recording,
             is_recording,
