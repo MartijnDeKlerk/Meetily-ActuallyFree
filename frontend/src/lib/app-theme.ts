@@ -9,7 +9,7 @@ import { useEffect, useState } from 'react';
  * The choice is stored in localStorage, which the main window and the minibar
  * share, so a change in Settings repaints both.
  */
-export type AppTheme = 'midnight' | 'vanilla' | 'charcoal';
+export type AppTheme = 'midnight' | 'vanilla' | 'latte' | 'charcoal';
 
 /** What the user picked: a fixed theme, or follow the operating system's light/dark setting. */
 export type ThemePreference = AppTheme | 'system';
@@ -39,6 +39,13 @@ export const THEMES: ThemeInfo[] = [
     swatch: ['#efe8dc', '#faf6ef', '#fffcf7', '#2a2319', '#2f5ecf'],
   },
   {
+    id: 'latte',
+    label: 'Latte',
+    description: 'Cool Catppuccin Latte with mauve accents.',
+    dark: false,
+    swatch: ['#dce0e8', '#eff1f5', '#f8f9fb', '#4c4f69', '#8839ef'],
+  },
+  {
     id: 'charcoal',
     label: 'Charcoal',
     description: 'Warm charcoal with clay accents.',
@@ -51,12 +58,13 @@ export const DEFAULT_THEME: AppTheme = 'midnight';
 const THEME_STORAGE_KEY = 'meetily_theme';
 /** Dark theme used while following the system; remembers the last dark theme picked. */
 const DARK_THEME_STORAGE_KEY = 'meetily_theme_dark';
-/** Light theme used while following the system. */
-const SYSTEM_LIGHT_THEME: AppTheme = 'vanilla';
+/** Light theme used while following the system; remembers the last light theme picked. */
+const LIGHT_THEME_STORAGE_KEY = 'meetily_theme_light';
+const DEFAULT_LIGHT_THEME: AppTheme = 'vanilla';
 const THEME_EVENT = 'af-theme-change';
 
 function normalizeTheme(value: string | null): AppTheme {
-  if (value === 'midnight' || value === 'vanilla' || value === 'charcoal') return value;
+  if (value === 'midnight' || value === 'vanilla' || value === 'latte' || value === 'charcoal') return value;
   // Stored by the old light/dark toggle.
   if (value === 'light') return 'vanilla';
   return DEFAULT_THEME;
@@ -149,6 +157,15 @@ function watchNativeSystemScheme(onChange: () => void): () => void {
   };
 }
 
+function savedLightTheme(): AppTheme {
+  try {
+    const saved = normalizeTheme(localStorage.getItem(LIGHT_THEME_STORAGE_KEY));
+    return themeInfo(saved).dark ? DEFAULT_LIGHT_THEME : saved;
+  } catch {
+    return DEFAULT_LIGHT_THEME;
+  }
+}
+
 function savedDarkTheme(): AppTheme {
   try {
     const saved = normalizeTheme(localStorage.getItem(DARK_THEME_STORAGE_KEY));
@@ -159,15 +176,17 @@ function savedDarkTheme(): AppTheme {
 }
 
 /**
- * Keep the fixed dark theme the user is on before "system" replaces it, so
+ * Keep the fixed theme the user is on before "system" replaces it, so
  * switching to system and back (or upgrading with Charcoal selected) does not
  * lose it. Must run before the system preference is resolved or persisted.
  */
-function rememberFixedDarkTheme() {
+function rememberFixedTheme() {
   try {
     const current = localStorage.getItem(THEME_STORAGE_KEY);
     if (current === 'midnight' || current === 'charcoal') {
       localStorage.setItem(DARK_THEME_STORAGE_KEY, current);
+    } else if (current === 'vanilla' || current === 'latte') {
+      localStorage.setItem(LIGHT_THEME_STORAGE_KEY, current);
     }
   } catch {
     // Falls back to the default dark theme.
@@ -177,7 +196,7 @@ function rememberFixedDarkTheme() {
 /** The concrete theme a preference paints right now. */
 export function resolveThemePreference(preference: ThemePreference): AppTheme {
   if (preference !== 'system') return preference;
-  return systemPrefersDark() ? savedDarkTheme() : SYSTEM_LIGHT_THEME;
+  return systemPrefersDark() ? savedDarkTheme() : savedLightTheme();
 }
 
 export function themeInfo(theme: AppTheme): ThemeInfo {
@@ -215,7 +234,9 @@ export function applyAppTheme(theme: AppTheme, persist = false, preference: Them
   if (persist) {
     try {
       localStorage.setItem(THEME_STORAGE_KEY, preference);
-      if (!followSystem && info.dark) localStorage.setItem(DARK_THEME_STORAGE_KEY, info.id);
+      if (!followSystem) {
+        localStorage.setItem(info.dark ? DARK_THEME_STORAGE_KEY : LIGHT_THEME_STORAGE_KEY, info.id);
+      }
     } catch {
       // Storage can be unavailable in locked-down webviews; the paint still applies.
     }
@@ -238,7 +259,8 @@ export const THEME_BOOT_SCRIPT = `
   try {
     var saved = localStorage.getItem('${THEME_STORAGE_KEY}');
     var darkSaved = localStorage.getItem('${DARK_THEME_STORAGE_KEY}');
-    var theme = saved === 'vanilla' || saved === 'charcoal' || saved === 'midnight'
+    var lightSaved = localStorage.getItem('${LIGHT_THEME_STORAGE_KEY}');
+    var theme = saved === 'vanilla' || saved === 'latte' || saved === 'charcoal' || saved === 'midnight'
       ? saved
       : (saved === 'light' ? 'vanilla' : 'midnight');
     if (saved === 'system') {
@@ -248,11 +270,11 @@ export const THEME_BOOT_SCRIPT = `
         : cached === '1';
       theme = dark
         ? (darkSaved === 'charcoal' ? 'charcoal' : 'midnight')
-        : 'vanilla';
+        : (lightSaved === 'latte' ? 'latte' : 'vanilla');
     }
     var root = document.documentElement;
     root.setAttribute('data-theme', theme);
-    if (theme === 'vanilla') root.classList.remove('dark');
+    if (theme === 'vanilla' || theme === 'latte') root.classList.remove('dark');
     else root.classList.add('dark');
   } catch (_) {}
 })();
@@ -299,7 +321,7 @@ export function useThemePreference(): [ThemePreference, (preference: ThemePrefer
   return [
     preference,
     (next: ThemePreference) => {
-      if (next === 'system') rememberFixedDarkTheme();
+      if (next === 'system') rememberFixedTheme();
       applyAppTheme(resolveThemePreference(next), true, next);
     },
   ];

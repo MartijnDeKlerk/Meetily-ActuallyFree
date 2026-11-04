@@ -44,11 +44,11 @@ export function ThemePicker() {
         <span>
           Match system appearance
           <span className="block text-xs text-af-text-3">
-            Vanilla in light mode; your last dark theme in dark mode.
+            Your last light theme in light mode; your last dark theme in dark mode.
           </span>
         </span>
       </label>
-    <div role="radiogroup" aria-label="Theme" className="grid gap-3 sm:grid-cols-3">
+    <div role="radiogroup" aria-label="Theme" className="grid gap-3 sm:grid-cols-2">
       {THEMES.map((theme) => {
         const selected = !following && theme.id === current;
         return (

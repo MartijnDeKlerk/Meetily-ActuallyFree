@@ -136,6 +136,66 @@
   --af-c-pink: #b8306f;
 }
 
+/* Latte: Catppuccin Latte, matching the light flavor used in Obsidian (AnuPpuccin). */
+:root[data-theme='latte'] {
+  color-scheme: light;
+  --af-bg-rgb: 220 224 232;
+  --af-panel-rgb: 239 241 245;
+  --af-panel-2-rgb: 230 233 239;
+  --af-elevated-rgb: 248 249 251;
+  --af-hover-rgb: 226 229 237;
+  --af-active-rgb: 211 215 225;
+  --af-raised-rgb: 252 252 253;
+  --af-border-rgb: 204 208 218;
+  --af-border-strong-rgb: 172 176 190;
+  --af-text-rgb: 76 79 105;
+  --af-text-2-rgb: 92 95 119;
+  --af-text-3-rgb: 108 111 133;
+  --af-text-4-rgb: 140 143 161;
+  --af-accent-rgb: 136 57 239;
+  --af-accent-hover-rgb: 118 40 214;
+  --af-on-accent-rgb: 255 255 255;
+  --af-record-rgb: 210 15 57;
+  --af-danger-rgb: 210 15 57;
+  --af-on-danger-rgb: 255 255 255;
+  --af-success-rgb: 64 160 43;
+  --af-warning-rgb: 178 106 14;
+  --af-shadow-rgb: 76 79 105;
+  --af-soft: 0.1;
+  --af-scrim: 0.32;
+  --background: 220 23.1% 94.9%;
+  --foreground: 234 16% 35.5%;
+  --card: 220 23.1% 94.9%;
+  --card-foreground: 234 16% 35.5%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 234 16% 35.5%;
+  --primary: 266 85% 58%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 220 22% 92%;
+  --secondary-foreground: 234 16% 35.5%;
+  --muted: 220 22% 92%;
+  --muted-foreground: 233 10.4% 47.3%;
+  --accent: 220 20.7% 88.6%;
+  --accent-foreground: 234 16% 35.5%;
+  --destructive: 347 86.7% 44.1%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 223 15.9% 82.7%;
+  --input: 225 13.6% 76.9%;
+  --ring: 266 85% 58%;
+
+  /* Latte accents, deepened where the stock value is too pale on a light surface. */
+  --af-c-slate: #6c6f85;
+  --af-c-red: #d20f39;
+  --af-c-orange: #d9540a;
+  --af-c-amber: #b26a0e;
+  --af-c-green: #348a22;
+  --af-c-teal: #137a80;
+  --af-c-sky: #0a82b3;
+  --af-c-blue: #1e66f5;
+  --af-c-violet: #8839ef;
+  --af-c-pink: #c9459f;
+}
+
 /* Charcoal */
 :root[data-theme='charcoal'] {
   color-scheme: dark;
@@ -707,6 +767,29 @@ html.minibar-window body {
   --border: 37.3 27.8% 73.9%;
   --input: 37.3 27.8% 73.9%;
   --ring: 222.4 63.0% 49.8%;
+  --radius: 0.625rem;
+}
+:root[data-theme='latte'] .bn-shadcn,
+:root[data-theme='latte'] .bn-shadcn.dark {
+  --background: 220.0 23.1% 94.9%;
+  --foreground: 234.0 16.0% 35.5%;
+  --card: 0.0 0.0% 100.0%;
+  --card-foreground: 234.0 16.0% 35.5%;
+  --popover: 0.0 0.0% 100.0%;
+  --popover-foreground: 234.0 16.0% 35.5%;
+  --primary: 266.0 85.0% 58.0%;
+  --primary-foreground: 0.0 0.0% 100.0%;
+  --secondary: 220.0 22.0% 92.0%;
+  --secondary-foreground: 234.0 16.0% 35.5%;
+  --muted: 220.0 22.0% 92.0%;
+  --muted-foreground: 233.0 10.4% 47.3%;
+  --accent: 220.0 20.7% 88.6%;
+  --accent-foreground: 234.0 16.0% 35.5%;
+  --destructive: 347.0 86.7% 44.1%;
+  --destructive-foreground: 0.0 0.0% 100.0%;
+  --border: 225.0 13.6% 76.9%;
+  --input: 225.0 13.6% 76.9%;
+  --ring: 266.0 85.0% 58.0%;
   --radius: 0.625rem;
 }
 :root[data-theme='charcoal'] .bn-shadcn,

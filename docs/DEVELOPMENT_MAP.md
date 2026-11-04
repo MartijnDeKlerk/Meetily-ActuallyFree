@@ -288,9 +288,13 @@ changing the signed executable payloads.
 
 ## Appearance
 
-`frontend/src/lib/app-theme.ts` owns theme state. The stored preference
+`frontend/src/lib/app-theme.ts` owns theme state. Fixed themes are Midnight,
+Charcoal (dark) and Vanilla, Latte (light); Latte is Catppuccin Latte with a mauve
+accent, matching the AnuPpuccin light flavor in Obsidian. System mode resolves
+light to the last light theme picked (`meetily_theme_light`, default Vanilla). Palettes live in `globals.css`
+(channel tokens plus a `.bn-shadcn` block for BlockNote). The stored preference
 (`meetily_theme`) is a fixed theme or `system`. In `system` mode the app resolves
-the OS scheme to Vanilla (light) or the last dark theme picked
+the OS scheme to the last light theme picked or the last dark theme picked
 (`meetily_theme_dark`) and repaints on OS changes.
 
 The OS scheme comes from `src-tauri/src/system_theme.rs`: on Linux it reads the
@@ -303,7 +307,7 @@ before it reads, so a change during startup is not lost. This is needed because 
 `None` and the frontend falls back to `prefers-color-scheme`. The last scheme is
 cached in `meetily_system_dark`, used by both the boot script and the runtime
 until the native read returns, so the first paint does not flip. Turning on
-system mode first records the current fixed dark theme in `meetily_theme_dark`.
+system mode first records the current fixed theme in `meetily_theme_dark` or `meetily_theme_light`.
 
 Tested: manually on KDE Plasma (follows live switches). Not tested: GNOME,
 macOS, Windows, or automated tests.
