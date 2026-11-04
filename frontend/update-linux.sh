@@ -41,6 +41,21 @@ else
     echo -e "${YELLOW}⚠️ $REPO_ROOT is not a git checkout - skipping git pull${NC}"
 fi
 
+# A pkg-config from Homebrew, conda or Nix can come first on PATH with a search
+# path that omits the distro's .pc files. tauri-cli then cannot find the tray
+# library (libayatana-appindicator) and fails while packaging, although the
+# library is installed. Append the distro directories so they are always seen;
+# existing entries keep priority.
+for pc_dir in /usr/lib/pkgconfig /usr/share/pkgconfig /usr/lib64/pkgconfig /usr/lib/x86_64-linux-gnu/pkgconfig; do
+    if [ -d "$pc_dir" ]; then
+        case ":${PKG_CONFIG_PATH:-}:" in
+            *":$pc_dir:"*) ;;
+            *) PKG_CONFIG_PATH="${PKG_CONFIG_PATH:+$PKG_CONFIG_PATH:}$pc_dir" ;;
+        esac
+    fi
+done
+export PKG_CONFIG_PATH
+
 # Install JS dependencies (picks up any dependency changes from the pull)
 cd "$SCRIPT_DIR"
 if command_exists pnpm; then

@@ -219,7 +219,11 @@ cd frontend
 This pulls the current branch, rebuilds, and atomically replaces the installed
 AppImage (default `~/Applications/Meetily-ActuallyFree.AppImage`; override
 with `INSTALL_DIR`/`INSTALL_NAME`). It refuses to run over uncommitted local
-changes.
+changes. It also adds the distro `pkgconfig` directories to `PKG_CONFIG_PATH`.
+If you run `tauri build` yourself and packaging fails with `Can't detect any
+appindicator library` although `libayatana-appindicator` is installed, a
+`pkg-config` from Homebrew, conda or Nix is probably first on `PATH`; add
+`/usr/lib/pkgconfig:/usr/share/pkgconfig` to `PKG_CONFIG_PATH`.
 
 </details>
 
