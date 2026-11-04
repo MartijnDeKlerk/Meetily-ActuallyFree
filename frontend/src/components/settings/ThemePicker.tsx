@@ -2,7 +2,7 @@
 
 import { Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { THEMES, getSavedAppTheme, useThemePreference, type ThemeInfo } from '@/lib/app-theme';
+import { THEMES, getSavedAppTheme, systemThemePair, useAppTheme, useThemePreference, type ThemeInfo } from '@/lib/app-theme';
 
 /** A tiny rendition of the app in the theme's own colors. */
 function ThemePreview({ theme }: { theme: ThemeInfo }) {
@@ -31,6 +31,10 @@ function ThemePreview({ theme }: { theme: ThemeInfo }) {
 export function ThemePicker() {
   const [current, setTheme] = useThemePreference();
   const following = current === 'system';
+  // Re-renders when the OS scheme flips, so the active/standby marks swap.
+  const [activeTheme] = useAppTheme();
+  const pair = systemThemePair();
+  const standbyTheme = following ? (pair.light === activeTheme ? pair.dark : pair.light) : null;
 
   return (
     <div className="space-y-3">
@@ -51,6 +55,9 @@ export function ThemePicker() {
     <div role="radiogroup" aria-label="Theme" className="grid gap-3 sm:grid-cols-2">
       {THEMES.map((theme) => {
         const selected = !following && theme.id === current;
+        const active = following && theme.id === activeTheme;
+        const standby = following && theme.id === standbyTheme;
+        const scheme = (id: string) => (id === pair.light ? 'light' : 'dark');
         return (
           <button
             key={theme.id}
@@ -61,21 +68,35 @@ export function ThemePicker() {
             className={cn(
               'group relative rounded-xl border p-2 text-left transition-[border-color,box-shadow,transform] duration-200 ease-af',
               'hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-af-accent/60',
-              selected
+              selected || active
                 ? 'border-af-accent shadow-[0_0_0_1px_rgb(var(--af-accent-rgb))]'
+                : standby
+                ? 'border-dashed border-af-accent/60'
                 : 'border-af-border hover:border-af-border-strong hover:shadow-md',
             )}
           >
             <ThemePreview theme={theme} />
             <div className="flex items-start justify-between gap-2 px-1 pb-0.5 pt-2.5">
               <div className="min-w-0">
-                <p className="text-sm font-medium text-af-text">{theme.label}</p>
+                <p className="text-sm font-medium text-af-text">
+                  {theme.label}
+                  {(active || standby) && (
+                    <span
+                      className={cn(
+                        'ml-2 rounded-full px-1.5 py-0.5 align-middle text-[10px] font-medium uppercase tracking-wide',
+                        active ? 'bg-af-accent text-af-on-accent' : 'border border-af-accent/60 text-af-text-3',
+                      )}
+                    >
+                      {active ? 'Active now' : `Next in ${scheme(theme.id)} mode`}
+                    </span>
+                  )}
+                </p>
                 <p className="mt-0.5 text-xs text-af-text-3">{theme.description}</p>
               </div>
               <span
                 className={cn(
                   'mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-colors duration-200',
-                  selected ? 'border-af-accent bg-af-accent text-af-on-accent' : 'border-af-border-strong text-transparent',
+                  selected || active ? 'border-af-accent bg-af-accent text-af-on-accent' : 'border-af-border-strong text-transparent',
                 )}
               >
                 <Check className="h-3 w-3" strokeWidth={3} />

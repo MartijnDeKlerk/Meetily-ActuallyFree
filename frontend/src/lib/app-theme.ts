@@ -193,6 +193,11 @@ function rememberFixedTheme() {
   }
 }
 
+/** The themes system mode uses for each OS scheme. */
+export function systemThemePair(): { light: AppTheme; dark: AppTheme } {
+  return { light: savedLightTheme(), dark: savedDarkTheme() };
+}
+
 /** The concrete theme a preference paints right now. */
 export function resolveThemePreference(preference: ThemePreference): AppTheme {
   if (preference !== 'system') return preference;

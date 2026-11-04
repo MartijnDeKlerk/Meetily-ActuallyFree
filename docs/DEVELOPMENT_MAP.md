@@ -291,7 +291,9 @@ changing the signed executable payloads.
 `frontend/src/lib/app-theme.ts` owns theme state. Fixed themes are Midnight,
 Charcoal (dark) and Vanilla, Latte (light); Latte is Catppuccin Latte with a mauve
 accent, matching the AnuPpuccin light flavor in Obsidian. System mode resolves
-light to the last light theme picked (`meetily_theme_light`, default Vanilla). Palettes live in `globals.css`
+light to the last light theme picked (`meetily_theme_light`, default Vanilla). In system mode the picker marks the
+theme in use ("Active now") and the one the other OS scheme would switch to
+(dashed border, "Next in light/dark mode"); they swap when the OS flips. Palettes live in `globals.css`
 (channel tokens plus a `.bn-shadcn` block for BlockNote). The stored preference
 (`meetily_theme`) is a fixed theme or `system`. In `system` mode the app resolves
 the OS scheme to the last light theme picked or the last dark theme picked
