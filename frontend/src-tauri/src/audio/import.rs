@@ -815,6 +815,9 @@ async fn get_or_init_whisper<R: Runtime>(
                 e.load_model(&target_model)
                     .await
                     .map_err(|e| anyhow!("Failed to load model '{}': {}", target_model, e))?;
+                if let Some(reason) = e.gpu_fallback_reason().await {
+                    crate::whisper_engine::gpu_preflight::emit_fallback(app, &target_model, &reason);
+                }
             }
 
             Ok(e)

@@ -49,6 +49,10 @@ pub struct WhisperEngine {
     cancel_download_flag: Arc<RwLock<Option<String>>>, // Model name being cancelled
     // Active downloads tracking to prevent concurrent downloads
     active_downloads: Arc<RwLock<HashSet<String>>>, // Set of models currently being downloaded
+    // Why the loaded model runs on the CPU although a GPU backend was compiled in.
+    // Written only by load_model together with current_model; None means the
+    // model runs with the acceleration the build selected.
+    gpu_fallback_reason: Arc<RwLock<Option<String>>>,
 }
 
 impl WhisperEngine {
@@ -104,7 +108,7 @@ impl WhisperEngine {
     /// hard-aborts (not a recoverable error) on the first GEMM call. Point
     /// `ROCBLAS_TENSILE_LIBPATH` at a system ROCm install instead, mirroring
     /// the ROCm path candidates already used by build-gpu.sh/dev-gpu.sh.
-    fn configure_rocm_tensile_libpath() {
+    pub(crate) fn configure_rocm_tensile_libpath() {
         if std::env::var_os("ROCBLAS_TENSILE_LIBPATH").is_some() {
             return;
         }
@@ -237,6 +241,7 @@ impl WhisperEngine {
             cancel_download_flag: Arc::new(RwLock::new(None)),
             // Initialize active downloads tracking
             active_downloads: Arc::new(RwLock::new(HashSet::new())),
+            gpu_fallback_reason: Arc::new(RwLock::new(None)),
         };
         
         Ok(engine)
@@ -333,11 +338,16 @@ impl WhisperEngine {
     }
     
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
-        let models = self.available_models.read().await;
-        let model_info = models.get(model_name)
-            .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
+        // Copy what is needed so the catalog lock is not held across the GPU check,
+        // which can take up to its timeout and would stall discovery and downloads.
+        let (model_status, model_path) = {
+            let models = self.available_models.read().await;
+            let model_info = models.get(model_name)
+                .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
+            (model_info.status.clone(), model_info.path.clone())
+        };
 
-        match model_info.status {
+        match model_status {
             ModelStatus::Available => {
                 // FIX 5: Check if this model is already loaded
                 if let Some(current_model) = self.current_model.read().await.as_ref() {
@@ -356,11 +366,33 @@ impl WhisperEngine {
                 // PERFORMANCE OPTIMIZATION: Use comprehensive hardware profile for optimal GPU configuration
                 let hardware_profile = crate::audio::HardwareProfile::detect();
                 let adaptive_config = hardware_profile.get_whisper_config();
-                let acceleration = whisper_context_acceleration_for(
+                let mut acceleration = whisper_context_acceleration_for(
                     WhisperCompiledBackend::current(),
                     hardware_profile.gpu_type,
                     hardware_profile.performance_tier,
                 );
+
+                // A GPU runtime failure inside whisper.cpp aborts the whole app, so
+                // prove the GPU path in a child process first. The model stays the
+                // same; only where it runs changes, and the reason is kept for the UI.
+                let mut gpu_fallback_reason = None;
+                if acceleration.use_gpu
+                    && super::gpu_preflight::requires_preflight(acceleration.compiled_backend)
+                {
+                    if let super::gpu_preflight::PreflightVerdict::Unusable(reason) =
+                        super::gpu_preflight::check(&model_path, acceleration).await
+                    {
+                        log::warn!(
+                            "Whisper {} GPU check failed for model {} ({}); loading it on the CPU instead",
+                            acceleration.compiled_backend.as_str(),
+                            model_name,
+                            reason
+                        );
+                        acceleration.use_gpu = false;
+                        acceleration.flash_attn = false;
+                        gpu_fallback_reason = Some(reason);
+                    }
+                }
 
                 let context_param = WhisperContextParameters {
                     use_gpu: acceleration.use_gpu,
@@ -384,7 +416,7 @@ impl WhisperEngine {
                     // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
 
                     // Load whisper context with hardware-optimized parameters
-                    WhisperContext::new_with_params(&*model_info.path.to_string_lossy(), context_param)
+                    WhisperContext::new_with_params(&*model_path.to_string_lossy(), context_param)
                         .map_err(|e| anyhow!("Failed to load model {}: {}", model_name, e))?
                     // Suppressor dropped here, stderr restored
                 };
@@ -392,9 +424,14 @@ impl WhisperEngine {
                 // Update current context and model
                 *self.current_context.write().await = Some(ctx);
                 *self.current_model.write().await = Some(model_name.to_string());
+                *self.gpu_fallback_reason.write().await = gpu_fallback_reason.clone();
 
                 // Enhanced acceleration status reporting
-                let acceleration_status = acceleration.status_label();
+                let acceleration_status = if gpu_fallback_reason.is_some() {
+                    "CPU processing (GPU check failed)"
+                } else {
+                    acceleration.status_label()
+                };
 
                 log::info!("Successfully loaded model: {} with {} (Performance Tier: {:?}, Beam Size: {}, Threads: {:?})",
                           model_name, acceleration_status, hardware_profile.performance_tier,
@@ -425,8 +462,14 @@ impl WhisperEngine {
 
         let mut model_name_guard = self.current_model.write().await;
         model_name_guard.take();
+        self.gpu_fallback_reason.write().await.take();
 
         unloaded
+    }
+
+    /// Set when the loaded model was moved to the CPU because the GPU check failed.
+    pub async fn gpu_fallback_reason(&self) -> Option<String> {
+        self.gpu_fallback_reason.read().await.clone()
     }
 
     pub async fn get_current_model(&self) -> Option<String> {

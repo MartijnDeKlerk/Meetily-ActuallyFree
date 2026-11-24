@@ -277,7 +277,8 @@ is `interrupted` on unwinding/cancellation; an abruptly killed process leaves it
 active in the last persisted snapshot. Completed/failed outcomes reflect Results.
 Native runtime checks, Parakeet/Whisper init/load, STT memory preparation, both
 recording start paths, lifecycle-lock waits, device/model checks, live diarization,
-capture startup/shutdown, final transcription drain and audio save are instrumented.
+capture startup/shutdown, final transcription drain, audio save, the Whisper GPU
+preflight and the whole Enhance (retranscription) job are instrumented.
 Snapshots are session-keyed, folded into pending.json before a new session starts,
 and old journals are pruned. Export uses that frozen report, never the next session.
 Legacy schema-1 pending reports remain readable. No frontend IPC payload, raw error,

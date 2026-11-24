@@ -251,6 +251,20 @@ export default function RootLayout({
     return () => { disposed = true; stop?.(); };
   }, []);
 
+  // Native whisper_engine/gpu_preflight.rs moved Whisper to the CPU because a
+  // GPU check crashed or failed; transcription still works but much slower.
+  useEffect(() => {
+    let disposed = false;
+    let stop: UnlistenFn | undefined;
+    void listen<{ modelName: string; reason: string }>('whisper-gpu-fallback', event => {
+      toast.warning('Whisper is running on the CPU', {
+        description: `The GPU check for ${event.payload.modelName} failed, so transcription will be slower. ${event.payload.reason}`,
+        duration: 15000,
+      });
+    }).then(unlisten => { if (disposed) unlisten(); else stop = unlisten; });
+    return () => { disposed = true; stop?.(); };
+  }, []);
+
   useEffect(() => {
     if (process.env.NODE_ENV === 'production') {
       const handleContextMenu = (e: MouseEvent) => e.preventDefault();
