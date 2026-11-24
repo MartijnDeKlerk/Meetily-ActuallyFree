@@ -794,9 +794,17 @@ async fn get_or_init_whisper<R: Runtime>(
                     warn!("Error during model discovery (continuing anyway): {}", discover_err);
                 }
 
-                match e.load_model(&target_model).await {
+                let loaded = crate::diagnostics::track(
+                    crate::diagnostics::Stage::WhisperLoad,
+                    e.load_model(&target_model),
+                )
+                .await;
+                match loaded {
                     Ok(_) => {
                         info!("Whisper model '{}' loaded successfully", target_model);
+                        if let Some(reason) = e.gpu_fallback_reason().await {
+                            crate::whisper_engine::gpu_preflight::emit_fallback(app, &target_model, &reason);
+                        }
                         Ok(e)
                     }
                     Err(load_err) => {
@@ -1057,6 +1065,9 @@ pub async fn start_retranscription_command<R: Runtime>(
     // Spawn the retranscription in a background task
     tauri::async_runtime::spawn(async move {
         let _operation_guard = crate::diarization::operation_guard().await;
+        // Covers the whole job so a native abort mid-enhance is visible in the
+        // next crash report instead of ending the timeline at the last recording.
+        let diagnostic = crate::diagnostics::Span::start(crate::diagnostics::Stage::Retranscription);
         let result = start_retranscription(
             guard,
             app,
@@ -1069,6 +1080,7 @@ pub async fn start_retranscription_command<R: Runtime>(
         )
         .await;
 
+        diagnostic.result(&result);
         // Errors are already emitted as events in start_retranscription
         // so we just log here for debugging
         if let Err(e) = result {

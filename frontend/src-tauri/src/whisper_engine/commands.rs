@@ -373,6 +373,9 @@ async fn whisper_load_model_inner(
         // FIX 6: Emit model loading completed/failed event
         if result.is_ok() {
             crate::audio::common::mark_stt_activity();
+            if let Some(reason) = engine.gpu_fallback_reason().await {
+                super::gpu_preflight::emit_fallback(&app_handle, &model_name, &reason);
+            }
             if let Err(e) = app_handle.emit(
                 "model-loading-completed",
                 serde_json::json!({

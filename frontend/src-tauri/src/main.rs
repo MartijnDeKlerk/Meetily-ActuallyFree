@@ -14,6 +14,13 @@ fn main() {
         app_lib::audio::permissions::print_audio_capture_status_and_exit();
     }
 
+    // A short-lived copy of the app tries one Whisper GPU encode, because a GPU
+    // runtime failure aborts the process (see whisper_engine/gpu_preflight.rs).
+    // Exit before logging or Tauri start so it never touches app state.
+    if std::env::args().nth(1).as_deref() == Some(app_lib::whisper_engine::gpu_preflight::GPU_PREFLIGHT_ARG) {
+        app_lib::whisper_engine::gpu_preflight::run_child_and_exit();
+    }
+
     std::env::set_var("RUST_LOG", "info");
     env_logger::init();
 

@@ -23,6 +23,7 @@ pub enum Stage {
     ParakeetLoad,
     WhisperInit,
     WhisperLoad,
+    WhisperGpuPreflight,
     SttMemoryPreparation,
     RecordingStart,
     LifecycleLock,
@@ -35,6 +36,7 @@ pub enum Stage {
     CaptureStop,
     TranscriptionDrain,
     RecordingSave,
+    Retranscription,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -276,6 +276,40 @@ stack UI; its previous Parakeet CPU pill was fixed text. An ignored test with
 the installed v3 INT8 model and synthetic silence confirms encoder nodes run
 on both DirectML and CPU; real speech performance remains unqualified.
 
+Whisper GPU loads on HIP (ROCm) builds are preflighted out of process by
+`whisper_engine/gpu_preflight.rs`. ggml aborts the whole app on a GPU BLAS/runtime
+error, so `WhisperEngine::load_model` first runs a copy of the executable
+(`main.rs`, `--whisper-gpu-preflight <model> <device> <flash-attn>`). The copy loads
+the model on the GPU and transcribes one second of silence, which runs the full
+encoder. Only a clean exit keeps the GPU. A signal, a non-zero exit or a 120 s
+timeout loads the same model on the CPU, records the reason
+(`gpu_fallback_reason()`) and emits `whisper-gpu-fallback`, which
+`app/layout.tsx` shows as a toast. This is not an engine substitution: the selected
+model and provider are kept. Verdicts are cached per process by model
+path/device/flash-attn, so a repaired GPU runtime is re-checked after a restart.
+Crash timelines gain `whisper_gpu_preflight` and `retranscription` stages, and the
+Enhance path's Whisper load is now tracked as `whisper_load`.
+The motivating failure: an AppImage bundling ROCm 7.2.4 `libamdhip64`/`librocblas`,
+pointed (by `configure_rocm_tensile_libpath`) at system ROCm 10.1 Tensile kernels,
+got `CUBLAS_STATUS_INTERNAL_ERROR` on its first fp16 `hipblasGemmEx` and aborted
+during Enhance. The bundled ROCm libraries must come from the same ROCm release as
+the system's `rocblas/library`, so rebuild the AppImage after a ROCm upgrade.
+CUDA/Vulkan/Metal builds are not preflighted: spawning the packaged executable
+has not been qualified on Windows or macOS.
+Coverage: `gpu_preflight::tests` cover backend gating, exit/signal descriptions
+and picking the ggml error line out of child stderr (with and without a gdb
+backtrace). Ran manually on an RX 9070 XT (gfx1201) with the real
+`large-v3-turbo-q5_0` model and a HIP release build: the child exits 0 on a working
+ROCm 10.1 HIP runtime (about 0.75 s, the cost added to each model's first GPU load
+per app run). It is caught as SIGABRT with ROCm 7.2.4 libraries on 10.1 kernels,
+and as SIGSEGV when run directly against CachyOS's system `hip-runtime-amd
+10.1-2.1` (its `hipMemset` crashed there unless `AMD_LOG_LEVEL=3`; Arch's `10.1-2`
+build passed). That segfault is intermittent: an AppImage bundling the same
+10.1-2.1 library passed the check, then crashed in the app's own GPU load during
+Enhance at the same `libamdhip64` frame. The preflight therefore does not protect
+against nondeterministic runtime faults; build the AppImage on a host with a working
+HIP runtime (Arch's `hip-runtime-amd 10.1-2` passed every run here).
+
 The universal Windows build script is
 `frontend/scripts/build-universal-windows.ps1`. It packages CPU/Vulkan/CUDA app
 variants; the runtime payload must match the one validated in tests. Validate with
